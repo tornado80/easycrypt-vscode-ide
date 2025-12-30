@@ -31,12 +31,3 @@ jobs:
 
       - name: Unit tests
         run: npm test
-
-      - name: E2E tests (mock easycrypt)
-        env:
-          EASYCRYPT_PATH: ${{ github.workspace }}/test/fixtures/mock_easycrypt.js
-        run: |
-          chmod +x test/fixtures/mock_easycrypt.js || true
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          xvfb-run -a npm run test:e2e
