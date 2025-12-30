@@ -1,5 +1,5 @@
 {
-  "name": "easycrypt-vscode",
+  "name": "easycrypt-vscode-ide",
   "displayName": "EasyCrypt",
   "description": "EasyCrypt language support for VS Code - syntax highlighting, proof navigation, and interactive proof development",
   "icon": "assets/icon.png",
@@ -8,7 +8,7 @@
   "license": "GPL-3.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/easycrypt/easycrypt-vscode-extension"
+    "url": "https://github.com/tornado80/easycrypt-vscode-ide"
   },
   "engines": {
     "vscode": "^1.85.0"
