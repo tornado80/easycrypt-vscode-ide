@@ -1,0 +1,96 @@
+name: Publish VSIX + Marketplace
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_to_marketplace:
+        description: 'Also publish to VS Code Marketplace'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-package-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: E2E tests (mock easycrypt)
+        env:
+          EASYCRYPT_PATH: ${{ github.workspace }}/test/fixtures/mock_easycrypt.js
+        run: |
+          chmod +x test/fixtures/mock_easycrypt.js || true
+          # Run VS Code extension tests headlessly on Linux.
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          xvfb-run -a npm run test:e2e
+
+      - name: Build VSIX
+        run: npm run package
+
+      - name: Resolve VSIX path
+        id: vsix
+        shell: bash
+        run: |
+          set -euo pipefail
+          vsix=$(ls -1 *.vsix | head -n 1)
+          if [[ -z "${vsix}" ]]; then
+            echo "No VSIX produced" >&2
+            exit 1
+          fi
+          echo "path=${vsix}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: ${{ steps.vsix.outputs.path }}
+
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ "${tag}" != "${version}" ]]; then
+            echo "Tag version (v${tag}) does not match package.json version (${version})." >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release (attach VSIX)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.vsix.outputs.path }}
+          generate_release_notes: true
+
+      - name: Publish to VS Code Marketplace
+        if: startsWith(github.ref, 'refs/tags/') || inputs.publish_to_marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCODE_MARKET_PAT }}
+        run: |
+          if [[ -z "${VSCE_PAT}" ]]; then
+            echo "Missing VSCODE_MARKET_PAT secret." >&2
+            exit 1
+          fi
+          npx --yes vsce publish -p "${VSCE_PAT}" -i "${{ steps.vsix.outputs.path }}"

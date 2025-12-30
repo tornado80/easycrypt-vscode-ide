@@ -1,0 +1,16 @@
+[20|check]>
+Current goal
+
+Type variables: <none>
+
+------------------------------------------------------------------------
+------------------------
+pre = true
+
+    F.f 
+    [=] 1%r
+
+post = true
+[21|check]>
+No more goals
+[22|check]>

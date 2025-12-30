@@ -1,0 +1,328 @@
+{
+  "name": "easycrypt-vscode",
+  "displayName": "EasyCrypt",
+  "description": "EasyCrypt language support for VS Code - syntax highlighting, proof navigation, and interactive proof development",
+  "version": "0.1.0",
+  "publisher": "tornado",
+  "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/easycrypt/easycrypt-vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:easycrypt"
+  ],
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "easycrypt",
+    "proof assistant",
+    "formal verification",
+    "cryptography"
+  ],
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "easycrypt.proofStateView",
+          "name": "Proof State",
+          "contextualTitle": "EasyCrypt Proof State"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "easycrypt.checkFile",
+        "title": "EasyCrypt: Check File",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "easycrypt.startProcess",
+        "title": "EasyCrypt: Start/Restart Process"
+      },
+      {
+        "command": "easycrypt.stopProcess",
+        "title": "EasyCrypt: Stop Process"
+      },
+      {
+        "command": "easycrypt.clearAllDiagnostics",
+        "title": "EasyCrypt: Clear All Diagnostics"
+      },
+      {
+        "command": "easycrypt.clearFileDiagnostics",
+        "title": "EasyCrypt: Clear File Diagnostics"
+      },
+      {
+        "command": "easycrypt.showDiagnosticCount",
+        "title": "EasyCrypt: Show Diagnostic Count"
+      },
+      {
+        "command": "easycrypt.stepForward",
+        "title": "EasyCrypt: Step Forward",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "easycrypt.stepBackward",
+        "title": "EasyCrypt: Step Backward",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "easycrypt.goToCursor",
+        "title": "EasyCrypt: Go to Cursor",
+        "icon": "$(target)"
+      },
+      {
+        "command": "easycrypt.resetProof",
+        "title": "EasyCrypt: Reset Proof State"
+      },
+      {
+        "command": "easycrypt.forceRecovery",
+        "title": "EasyCrypt: Force Recovery (Fix Desync)"
+      },
+      {
+        "command": "easycrypt.toggleVerboseLogging",
+        "title": "EasyCrypt: Toggle Verbose Logging"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "easycrypt.checkFile",
+          "when": "resourceLangId == easycrypt",
+          "group": "navigation"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "easycrypt.checkFile",
+          "when": "resourceLangId == easycrypt"
+        },
+        {
+          "command": "easycrypt.clearFileDiagnostics",
+          "when": "resourceLangId == easycrypt"
+        },
+        {
+          "command": "easycrypt.stepForward",
+          "when": "resourceLangId == easycrypt"
+        },
+        {
+          "command": "easycrypt.stepBackward",
+          "when": "resourceLangId == easycrypt"
+        },
+        {
+          "command": "easycrypt.goToCursor",
+          "when": "resourceLangId == easycrypt"
+        },
+        {
+          "command": "easycrypt.resetProof",
+          "when": "resourceLangId == easycrypt"
+        },
+        {
+          "command": "easycrypt.forceRecovery",
+          "when": "resourceLangId == easycrypt"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "easycrypt.checkFile",
+        "key": "ctrl+shift+c",
+        "mac": "cmd+shift+c",
+        "when": "resourceLangId == easycrypt"
+      },
+      {
+        "command": "easycrypt.stepForward",
+        "key": "alt+down",
+        "mac": "alt+down",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'default'"
+      },
+      {
+        "command": "easycrypt.stepBackward",
+        "key": "alt+up",
+        "mac": "alt+up",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'default'"
+      },
+      {
+        "command": "easycrypt.goToCursor",
+        "key": "alt+right",
+        "mac": "alt+right",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'default'"
+      },
+      {
+        "command": "easycrypt.resetProof",
+        "key": "alt+left",
+        "mac": "alt+left",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'default'"
+      },
+      {
+        "command": "easycrypt.stepForward",
+        "key": "ctrl+alt+down",
+        "mac": "ctrl+down",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'proof-general'"
+      },
+      {
+        "command": "easycrypt.stepBackward",
+        "key": "ctrl+alt+up",
+        "mac": "ctrl+up",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'proof-general'"
+      },
+      {
+        "command": "easycrypt.goToCursor",
+        "key": "ctrl+alt+right",
+        "mac": "ctrl+right",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'proof-general'"
+      },
+      {
+        "command": "easycrypt.resetProof",
+        "key": "ctrl+alt+left",
+        "mac": "ctrl+left",
+        "when": "resourceLangId == easycrypt && config.easycrypt.keybindings.profile == 'proof-general'"
+      }
+    ],
+    "languages": [
+      {
+        "id": "easycrypt",
+        "aliases": [
+          "EasyCrypt",
+          "easycrypt"
+        ],
+        "extensions": [
+          ".ec",
+          ".eca"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/easycrypt-light.png",
+          "dark": "./icons/easycrypt-dark.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "easycrypt",
+        "scopeName": "source.easycrypt",
+        "path": "./syntaxes/easycrypt.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "EasyCrypt",
+      "properties": {
+        "easycrypt.keybindings.profile": {
+          "type": "string",
+          "enum": ["default", "proof-general", "none"],
+          "enumDescriptions": [
+            "Default keybindings: Alt+Down/Up/Right/Left for navigation",
+            "Proof General style: Ctrl+Alt+Down/Up/Right/Left (Ctrl+Down/Up/Right/Left on Mac)",
+            "No keybindings: Disable all extension-provided keybindings (use VS Code's keyboard shortcuts to set your own)"
+          ],
+          "default": "default",
+          "description": "Select a keybinding profile for proof navigation commands. The toolbar buttons in the Proof State view work regardless of this setting.",
+          "scope": "window"
+        },
+        "easycrypt.executablePath": {
+          "type": "string",
+          "default": "easycrypt",
+          "description": "Absolute path to the EasyCrypt binary. If not set, the extension will attempt to find 'easycrypt' in your system PATH.",
+          "scope": "window"
+        },
+        "easycrypt.arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional arguments to pass to EasyCrypt on startup (e.g., include paths, flags).",
+          "scope": "window"
+        },
+        "easycrypt.proverArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Arguments specifically for backend provers (Alt-Ergo, Z3, etc.) if passed through EasyCrypt.",
+          "scope": "window"
+        },
+        "easycrypt.diagnostics.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable diagnostics reporting.",
+          "scope": "window"
+        },
+        "easycrypt.diagnostics.liveChecks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable live syntax checking as you type. When enabled, the extension will automatically check for errors while editing.",
+          "scope": "window"
+        },
+        "easycrypt.diagnostics.delay": {
+          "type": "number",
+          "default": 500,
+          "minimum": 100,
+          "maximum": 5000,
+          "description": "Delay in milliseconds before running a live syntax check after typing stops.",
+          "scope": "window"
+        },
+        "easycrypt.diagnostics.onChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run syntax checks when the document content changes.",
+          "scope": "window"
+        },
+        "easycrypt.diagnostics.onSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run syntax checks when the document is saved.",
+          "scope": "window"
+        },
+        "easycrypt.verboseLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose logging to the EasyCrypt output channel. Logs all commands, events, process I/O, and proof state transitions. Useful for debugging.",
+          "scope": "window"
+        },
+        "easycrypt.proofStateView.debug.showEmacsPromptMarker": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the EasyCrypt cli -emacs prompt marker (e.g. [n|check]>) in the Proof State view for debugging and correlating with Output logs.",
+          "scope": "window"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src",
+    "pretest": "npm run compile",
+    "test": "mocha \"test/**/*.test.js\" --exclude \"test/e2e/**\"",
+    "test:e2e": "node ./test/e2e/runTest.js",
+    "test:unit": "mocha \"out/test/**/*.test.js\"",
+    "package": "npm run compile && vsce package",
+    "publish": "vsce publish",
+    "publish:patch": "vsce publish patch",
+    "publish:minor": "vsce publish minor",
+    "publish:major": "vsce publish major"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.50.1",
+    "@typescript-eslint/parser": "^8.50.1",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.2",
+    "chai": "^5.1.2",
+    "eslint": "^9.39.2",
+    "mocha": "^10.8.2",
+    "typescript": "^5.3.0",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.2.0"
+  }
+}
