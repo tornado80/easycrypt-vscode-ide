@@ -2,6 +2,7 @@
   "name": "easycrypt-vscode",
   "displayName": "EasyCrypt",
   "description": "EasyCrypt language support for VS Code - syntax highlighting, proof navigation, and interactive proof development",
+  "icon": "assets/icon.png",
   "version": "0.1.0",
   "publisher": "tornado",
   "license": "GPL-3.0",
@@ -32,6 +33,7 @@
           "type": "webview",
           "id": "easycrypt.proofStateView",
           "name": "Proof State",
+          "icon": "assets/icon.png",
           "contextualTitle": "EasyCrypt Proof State"
         }
       ]
