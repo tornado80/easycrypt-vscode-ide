@@ -85,20 +85,21 @@ describe('EasyCrypt Emacs Prompt Counter', function() {
             assert.deepStrictEqual(result.promptNumbers, [0, 1]);
             assert.strictEqual(state.totalResponsePrompts, 1);
             assert.strictEqual(state.ignoredStartupPrompt, true);
-            assert.strictEqual(state.ignoredLeadingPrompt, false);
         });
 
-        it('ignores leading prompt when it appears at start before content', function() {
+        it('does NOT ignore non-startup prompt even when it appears at chunk start', function() {
             const state = createPromptCounterState();
-            // Simulates: prompt from previous command coalesced with current response
+            // This pattern can occur in batched sends when the first processed statement
+            // produces no output, so the first prompt is immediately followed by the next
+            // statement's output.
             const chunk = '[50|check]>\nSome response output\n[51|check]>';
             
             const result = countResponsePrompts(chunk, state);
             
-            // First prompt (0) is leading, second (1) is the response prompt
+            // Both prompts are valid response delimiters and must be counted.
             assert.strictEqual(result.totalPrompts, 2);
-            assert.strictEqual(result.responsePrompts, 1);
-            assert.strictEqual(state.ignoredLeadingPrompt, true);
+            assert.strictEqual(result.responsePrompts, 2);
+            assert.strictEqual(state.ignoredStartupPrompt, false);
         });
 
         it('does NOT ignore leading prompt when there is content before it', function() {
@@ -110,26 +111,25 @@ describe('EasyCrypt Emacs Prompt Counter', function() {
             
             assert.strictEqual(result.totalPrompts, 1);
             assert.strictEqual(result.responsePrompts, 1);
-            assert.strictEqual(state.ignoredLeadingPrompt, false);
+            assert.strictEqual(state.ignoredStartupPrompt, false);
         });
 
-        it('only ignores leading prompt once per command batch', function() {
+        it('does not ignore non-startup prompts across multiple chunks', function() {
             const state = createPromptCounterState();
             
-            // First chunk: leading prompt followed by content and response prompt
+            // First chunk: two prompts, both count
             const chunk1 = '[10|check]>\nOutput\n[11|check]>';
             const result1 = countResponsePrompts(chunk1, state);
             
-            assert.strictEqual(result1.responsePrompts, 1);
-            assert.strictEqual(state.ignoredLeadingPrompt, true);
+            assert.strictEqual(result1.responsePrompts, 2);
+            assert.strictEqual(state.ignoredStartupPrompt, false);
             
-            // Second chunk: another leading prompt pattern, but we already ignored one
+            // Second chunk: both prompts count as well
             const chunk2 = '[12|check]>\nMore output\n[13|check]>';
             const result2 = countResponsePrompts(chunk2, state);
             
-            // Both prompts should be counted (no more ignoring)
             assert.strictEqual(result2.responsePrompts, 2);
-            assert.strictEqual(state.totalResponsePrompts, 3);
+            assert.strictEqual(state.totalResponsePrompts, 4);
         });
 
         it('does not ignore prompt when chunk is prompt-only (no content)', function() {
@@ -141,18 +141,18 @@ describe('EasyCrypt Emacs Prompt Counter', function() {
             
             // No content after the prompt, so don't ignore it
             assert.strictEqual(result.responsePrompts, 1);
-            assert.strictEqual(state.ignoredLeadingPrompt, false);
+            assert.strictEqual(state.ignoredStartupPrompt, false);
         });
 
-        it('handles real-world scenario: batch with leading prompt coalescing', function() {
+        it('handles real-world scenario: batch where first statement is silent', function() {
             const state = createPromptCounterState();
             
-            // Chunk 1: Previous command's trailing prompt + first command's output + prompt
-            const chunk1 = '[50|check]>\nProcessed statement 1\n[51|check]>';
+            // Chunk 1: prompt for statement 1 (silent), then output for statement 2, then prompt
+            const chunk1 = '[50|check]>\nProcessed statement 2\n[51|check]>';
             const result1 = countResponsePrompts(chunk1, state);
             
-            // [50] is leading (ignored), [51] is response
-            assert.strictEqual(result1.responsePrompts, 1);
+            // Both prompts must be counted.
+            assert.strictEqual(result1.responsePrompts, 2);
             
             // Chunk 2: Second command's output + prompt
             const chunk2 = 'Processed statement 2\n[52|check]>';
@@ -160,8 +160,8 @@ describe('EasyCrypt Emacs Prompt Counter', function() {
             
             assert.strictEqual(result2.responsePrompts, 1);
             
-            // Total: 2 response prompts
-            assert.strictEqual(state.totalResponsePrompts, 2);
+            // Total: 3 response prompts
+            assert.strictEqual(state.totalResponsePrompts, 3);
         });
 
     });
@@ -220,15 +220,15 @@ describe('EasyCrypt Emacs Prompt Counter', function() {
             counter.ingestChunk('[50|check]>\nOutput\n[51|check]>');
             counter.ingestChunk('More output\n[2|check]>');
             
-            assert.strictEqual(counter.getTotalResponsePrompts(), 2);
-            assert.strictEqual(counter.hasIgnoredLeadingPrompt(), true);
+            assert.strictEqual(counter.getTotalResponsePrompts(), 3);
+            assert.strictEqual(counter.hasIgnoredLeadingPrompt(), false);
         });
 
         it('reset clears all state', function() {
             const counter = new EmacsPromptCounter();
             
             counter.ingestChunk('[50|check]>\nOutput\n[51|check]>');
-            assert.strictEqual(counter.getTotalResponsePrompts(), 1);
+            assert.strictEqual(counter.getTotalResponsePrompts(), 2);
             
             counter.reset();
             
@@ -243,8 +243,8 @@ describe('EasyCrypt Emacs Prompt Counter', function() {
             
             const summary = counter.getDebugSummary();
             
-            assert.ok(summary.includes('responsePrompts=1'));
-            assert.ok(summary.includes('ignoredLeading=true') || summary.includes('ignoredStartup=true'));
+            assert.ok(summary.includes('responsePrompts=2'));
+            assert.ok(summary.includes('ignoredStartup=false'));
         });
 
     });

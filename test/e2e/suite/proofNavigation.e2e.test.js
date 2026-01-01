@@ -276,6 +276,47 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
     }
   });
 
+  it('goToCursor succeeds when first statement is silent (prompt coalesced with next output)', async function () {
+    // Enable deterministic reproduction in the mock.
+    process.env.MOCK_EC_COALESCE_FIRST_PROMPT_WITH_NEXT_OUTPUT = '1';
+
+    const { path: filePath, cleanup } = await createTempEcFile(
+      [
+        // Two statements are enough: the mock will hold the first prompt and emit it
+        // right before the second statement's output.
+        'require import A.',
+        'lemma t : true.',
+        'proof.',
+        '  trivial.',
+        'qed.',
+        '',
+      ].join('\n'),
+      'silent_first_statement.ec'
+    );
+
+    try {
+      // Ensure we spawn a fresh mock process that sees the env var.
+      await vscode.commands.executeCommand('easycrypt.stopProcess');
+      await vscode.commands.executeCommand('easycrypt.startProcess');
+
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+      await vscode.languages.setTextDocumentLanguage(doc, 'easycrypt');
+      const editor = await vscode.window.showTextDocument(doc);
+
+      // Place cursor after the second statement so goToCursor batches at least 2 statements.
+      editor.selection = new vscode.Selection(new vscode.Position(1, 0), new vscode.Position(1, 0));
+      const r = await vscode.commands.executeCommand('easycrypt.goToCursor');
+      assert.ok(r && r.success, `Expected goToCursor success, got: ${JSON.stringify(r)}`);
+
+      const offset = await vscode.commands.executeCommand('easycrypt._getExecutionOffset');
+      assert.ok(typeof offset === 'number' && offset > 0);
+    } finally {
+      delete process.env.MOCK_EC_COALESCE_FIRST_PROMPT_WITH_NEXT_OUTPUT;
+      await vscode.commands.executeCommand('easycrypt.stopProcess');
+      await cleanup();
+    }
+  });
+
   it('backward goToCursor performs a single restart (regression)', async function () {
     // This test captures the historical O(k*n) regression where jumping backward
     // would loop over stepBackward() and, when undo is unsupported, trigger a full

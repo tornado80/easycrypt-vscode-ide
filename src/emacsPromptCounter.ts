@@ -34,10 +34,6 @@ export interface PromptCountingResult {
 export interface PromptCounterState {
     /** Whether we've already ignored the startup prompt [0|check]> */
     ignoredStartupPrompt: boolean;
-    /** Whether we've already ignored a leading prompt for this command */
-    ignoredLeadingPrompt: boolean;
-    /** Whether we've seen any non-prompt content */
-    seenNonPromptContent: boolean;
     /** Total response prompts counted so far */
     totalResponsePrompts: number;
     /** All prompt numbers seen (for debugging) */
@@ -56,8 +52,6 @@ const EMACS_PROMPT_REGEX = /\[(\d+)\|([^\]]+)\]>\s*/g;
 export function createPromptCounterState(): PromptCounterState {
     return {
         ignoredStartupPrompt: false,
-        ignoredLeadingPrompt: false,
-        seenNonPromptContent: false,
         totalResponsePrompts: 0,
         allPromptNumbers: []
     };
@@ -106,59 +100,22 @@ export function countResponsePrompts(
     result.totalPrompts = matches.length;
 
     if (matches.length === 0) {
-        // No prompts in this chunk, but we've now seen non-prompt content
-        if (chunk.trim().length > 0) {
-            state.seenNonPromptContent = true;
-        }
         return result;
     }
 
-    // Determine if there's non-prompt content before the first prompt
-    const firstPrompt = matches[0];
-    const contentBeforeFirstPrompt = chunk.slice(0, firstPrompt.index).trim();
-
-    // Check for content between prompts and after the last prompt
-    let hasNonPromptContent = contentBeforeFirstPrompt.length > 0;
-    for (let i = 0; i < matches.length; i++) {
-        const m = matches[i];
-        const endOfPrompt = m.index + m.length;
-        const nextPromptStart = i + 1 < matches.length ? matches[i + 1].index : chunk.length;
-        const contentBetween = chunk.slice(endOfPrompt, nextPromptStart).trim();
-        if (contentBetween.length > 0) {
-            hasNonPromptContent = true;
-        }
-    }
-
-    // Decide whether to ignore the first prompt as a "leading prompt".
+    // Ignore the process startup prompt [0|check]>.
     //
-    // There are two cases we need to handle:
-    // 1) Process startup prompt: EasyCrypt prints an initial prompt like [0|check]> BEFORE
-    //    any command is processed. If a sendAndWait starts immediately after process start,
-    //    the banner + initial [0|check]> can arrive while we're pending. That prompt must
-    //    never count toward response completion.
-    //
-    // 2) Coalesced leading prompt: stdout chunks can begin with the trailing prompt from
-    //    the previous command (prompt appears before any response content).
+    // Important: we do NOT attempt to ignore an additional "leading prompt" at the start
+    // of a response. In batched sends, it is common for the first processed statement to
+    // produce no output; EasyCrypt still prints the prompt for that statement, and the next
+    // statement's output may follow immediately. Treating that prompt as "leading" causes an
+    // off-by-one undercount and can lead to sendAndWait timeouts.
     let promptsToIgnore = 0;
-
     const isFirstPromptOverall = state.allPromptNumbers.length === 0;
     const isStartupPromptZero = isFirstPromptOverall && matches[0]?.promptNum === 0;
     if (!state.ignoredStartupPrompt && isStartupPromptZero) {
-        // Always ignore the startup prompt [0|check]> regardless of surrounding banner text.
         promptsToIgnore = 1;
         state.ignoredStartupPrompt = true;
-    } else if (!state.ignoredLeadingPrompt && !state.seenNonPromptContent) {
-        // This is potentially the first chunk and we haven't seen response content yet.
-        // If there's no content before the first prompt AND there's content after it,
-        // this first prompt is likely a coalesced prompt from the previous command.
-        //
-        // However, we should NOT ignore if:
-        // - There's content before the first prompt (it's a response prompt)
-        // - There's no content after any prompts (prompt-only chunk - rare edge case)
-        if (contentBeforeFirstPrompt.length === 0 && hasNonPromptContent) {
-            promptsToIgnore = 1;
-            state.ignoredLeadingPrompt = true;
-        }
     }
 
     // Count response prompts
@@ -174,11 +131,6 @@ export function countResponsePrompts(
 
         result.responsePrompts++;
         state.totalResponsePrompts++;
-    }
-
-    // If there's any non-prompt content in this chunk, mark it
-    if (hasNonPromptContent) {
-        state.seenNonPromptContent = true;
     }
 
     return result;
@@ -228,7 +180,7 @@ export class EmacsPromptCounter {
      * Gets whether a leading prompt was ignored.
      */
     public hasIgnoredLeadingPrompt(): boolean {
-        return this.state.ignoredLeadingPrompt || this.state.ignoredStartupPrompt;
+        return this.state.ignoredStartupPrompt;
     }
 
     /**
@@ -239,8 +191,8 @@ export class EmacsPromptCounter {
             `responsePrompts=${this.state.totalResponsePrompts}`,
             `promptNumbers=[${this.state.allPromptNumbers.join(',')}]`,
             `ignoredStartup=${this.state.ignoredStartupPrompt}`,
-            `ignoredLeading=${this.state.ignoredLeadingPrompt}`,
-            `seenContent=${this.state.seenNonPromptContent}`
+            `ignoredLeading=false`,
+            `seenContent=true`
         ].join(', ');
     }
 }

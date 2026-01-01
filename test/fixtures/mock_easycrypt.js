@@ -45,6 +45,18 @@ if (looksLikeFlag(command)) {
     let rapidCommandStreak = 0;
     let promptCounter = 1;
 
+    // When enabled, the mock will treat the first processed statement as "silent" and
+    // will coalesce its prompt with the *next* statement's output. This deterministically
+    // simulates a real-world pattern seen in EasyCrypt where the first statement in a
+    // batched send produces no output, so a chunk can begin with a prompt like:
+    //   [1|check]>
+    //   + added ...
+    //   [2|check]>
+    // This pattern previously triggered an off-by-one prompt undercount in the extension.
+    const coalesceFirstPromptWithNextOutput = process.env.MOCK_EC_COALESCE_FIRST_PROMPT_WITH_NEXT_OUTPUT === '1';
+    let firstProcessedStatement = true;
+    let pendingCoalescedPromptLine = undefined;
+
     // Tracks whether multiple input lines arrived in the same burst.
     // Used to simulate "batch-only" failures deterministically.
     let inputBurstCount = 0;
@@ -78,6 +90,22 @@ if (looksLikeFlag(command)) {
         writeLine(`[${promptCounter++}|check]>`);
         if (burstyPrompts && burstDelayMs > 0) {
             await new Promise((r) => setTimeout(r, burstDelayMs));
+        }
+    };
+
+    const maybeFlushCoalescedPrompt = () => {
+        if (pendingCoalescedPromptLine) {
+            writeLine(pendingCoalescedPromptLine);
+            pendingCoalescedPromptLine = undefined;
+        }
+    };
+
+    const emitPromptPossiblyCoalesced = async () => {
+        if (coalesceFirstPromptWithNextOutput && firstProcessedStatement) {
+            // Hold the prompt and write it before the next statement's output.
+            pendingCoalescedPromptLine = `[${promptCounter++}|check]>`;
+        } else {
+            await emitPrompt();
         }
     };
 
@@ -154,21 +182,28 @@ if (looksLikeFlag(command)) {
 
             // Simulate errors for specific patterns
             if (trimmed.includes('undefined_symbol')) {
+                maybeFlushCoalescedPrompt();
                 emitError(lineNumber, 1, trimmed.length, 'unknown symbol: undefined_symbol');
             } else if (trimmed.includes('syntax_error')) {
+                maybeFlushCoalescedPrompt();
                 emitError(lineNumber, 1, trimmed.length, 'parse error');
             } else if (trimmed.includes('type_error')) {
+                maybeFlushCoalescedPrompt();
                 emitError(lineNumber, 1, trimmed.length, 'type error: expected int, got bool');
             } else if (trimmed === 'admit.') {
+                maybeFlushCoalescedPrompt();
                 writeLine('Warning: proof completed with admit');
             } else if (trimmed === 'qed.') {
+                maybeFlushCoalescedPrompt();
                 writeLine('No more goals');
             } else {
                 // Normal output
+                maybeFlushCoalescedPrompt();
                 writeLine(`Processed line ${lineNumber}: ${trimmed.substring(0, 30)}...`);
             }
 
-            await emitPrompt();
+            await emitPromptPossiblyCoalesced();
+            firstProcessedStatement = false;
             lineNumber++;
         });
     });
