@@ -5,6 +5,10 @@
  * through proof scripts, tracking the execution position, and coordinating
  * with the ProcessManager and EditorDecorator.
  * 
+ * Supports fast backward navigation via `undo <uuid>.` when the UndoStateTracker
+ * has a valid mapping. Falls back to restart + replay when the tracker is invalid
+ * or when undo fails.
+ * 
  * @module stepManager
  */
 
@@ -17,6 +21,7 @@ import { StatementIndex } from './statementIndex';
 import { parseOutput } from './outputParser';
 import { EmacsPromptCounter } from './emacsPromptCounter';
 import { Logger } from './logger';
+import { UndoStateTracker, extractAllPrompts, PromptInfo } from './undoStateTracker';
 
 /**
  * Result of a step operation
@@ -94,6 +99,9 @@ export class StepManager implements vscode.Disposable {
 
     /** Cached statement index for efficient cursor-to-statement mapping */
     private statementIndex: StatementIndex = new StatementIndex();
+
+    /** Undo state tracker for fast backward navigation via `undo <uuid>.` */
+    private undoStateTracker: UndoStateTracker;
     
     /** Event emitters */
     private readonly _onDidChangePosition = new vscode.EventEmitter<vscode.Position>();
@@ -121,6 +129,17 @@ export class StepManager implements vscode.Disposable {
         outputChannel?: vscode.OutputChannel
     ) {
         this.outputChannel = outputChannel;
+        
+        // Initialize undo state tracker for fast backward navigation
+        this.undoStateTracker = new UndoStateTracker(outputChannel, true);
+        this.disposables.push(this.undoStateTracker);
+        
+        // Log when undo state tracker becomes invalid
+        this.disposables.push(
+            this.undoStateTracker.onDidBecomeInvalid(({ reason }) => {
+                this.log(`UndoStateTracker invalidated: ${reason}. Falling back to restart+replay for backward navigation.`);
+            })
+        );
         
         // Listen for process output to resolve pending step operations
         this.disposables.push(
@@ -383,12 +402,18 @@ export class StepManager implements vscode.Disposable {
             return { success: false, error: 'No more statements' };
         }
         
-        this.log(`Stepping forward: "${statement.text.substring(0, 50)}..."`);
+        // Get the statement index for undo tracking
+        const statementsBeforeThis = this.statementIndex.getStatementsUpTo(this.executionOffset);
+        const statementIndex = statementsBeforeThis.length;
+        
+        this.log(`Stepping forward: "${statement.text.substring(0, 50)}..." (statementIndex=${statementIndex})`);
         
         // Ensure process is running
         if (!this.processManager.isRunning()) {
             try {
                 await this.processManager.start();
+                // Initialize undo tracker when process starts
+                this.undoStateTracker.initialize(0);
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
                 return { success: false, error: `Failed to start process: ${msg}` };
@@ -405,6 +430,9 @@ export class StepManager implements vscode.Disposable {
             editor.document.positionAt(statement.endOffset)
         );
         this.decorator.setProcessingRange(editor, processingRange);
+        
+        // Track undo state: capture pre-state uuid before sending
+        this.undoStateTracker.beforeStatementSend(statementIndex);
         
         try {
             // Send statement to process and wait for output
@@ -433,6 +461,15 @@ export class StepManager implements vscode.Disposable {
             this.executionOffset = statement.endOffset;
             this.updateDecorations();
             this._onDidChangePosition.fire(this.getExecutionPosition());
+            
+            // Track undo state: record the post-state uuid
+            const prompts = extractAllPrompts(output.raw ?? '');
+            if (prompts.length > 0) {
+                const lastPrompt = prompts[prompts.length - 1];
+                this.undoStateTracker.afterStatementProcessed(statementIndex, lastPrompt.promptInfo);
+            } else {
+                this.log(`Warning: No prompt found in output, undo tracking may be incomplete`);
+            }
 
             // Publish proof state once (final output only) with updated progress
             const progress = this.computeProgressSnapshot();
@@ -471,8 +508,9 @@ export class StepManager implements vscode.Disposable {
     /**
      * Steps backward by one statement
      * 
-     * Implements Smart Recovery: If undo fails (e.g., process desync),
-     * automatically triggers a full recovery by resetting and re-executing.
+     * Implements fast backward navigation via `undo <uuid>.` when the
+     * UndoStateTracker has a valid mapping. Falls back to restart + replay
+     * when the tracker is invalid or when undo fails.
      * 
      * @param internal - Whether this is an internal call (e.g., from retraction)
      * @returns Result of the step operation
@@ -498,13 +536,39 @@ export class StepManager implements vscode.Disposable {
         const prevEnd = findPreviousStatementEnd(text, this.executionOffset);
         const newOffset = prevEnd !== null ? prevEnd : 0;
         
-        this.log(`Stepping backward from ${this.executionOffset} to ${newOffset}`);
+        // Compute current and target statement counts
+        this.statementIndex.update(text, editor.document.version);
+        const currentStatements = this.statementIndex.getStatementsUpTo(this.executionOffset);
+        const targetStatements = this.statementIndex.getStatementsUpTo(newOffset);
+        const currentCount = currentStatements.length;
+        const targetCount = targetStatements.length;
+        
+        this.log(`Stepping backward from ${this.executionOffset} to ${newOffset} (statements: ${currentCount} -> ${targetCount})`);
 
         this.stepping = true;
         this._onDidStartStep.fire();
 
         try {
-            // Backward navigation uses restart + replay (no `undo.`).
+            // Try fast undo-to-state if tracker is valid
+            if (this.undoStateTracker.isValid() && this.processManager.isRunning()) {
+                const undoResult = await this.tryUndoToState(targetCount, currentCount, editor);
+                if (undoResult.success) {
+                    this.log(`Fast undo-to-state succeeded`);
+                    const result: StepResult = {
+                        success: true,
+                        output: undoResult.output,
+                        executionOffset: this.executionOffset
+                    };
+                    this._onDidCompleteStep.fire(result);
+                    return result;
+                }
+                // Undo failed, fall back to recovery
+                this.log(`Fast undo-to-state failed: ${undoResult.error}. Falling back to restart+replay.`);
+            } else {
+                this.log(`Undo-to-state not available (tracker valid: ${this.undoStateTracker.isValid()}, process running: ${this.processManager.isRunning()}). Using restart+replay.`);
+            }
+            
+            // Fallback: restart + replay
             const recoveryResult = await this.recoverState(newOffset, editor);
             const result: StepResult = {
                 success: recoveryResult.success,
@@ -516,6 +580,118 @@ export class StepManager implements vscode.Disposable {
             return result;
         } finally {
             this.stepping = false;
+        }
+    }
+
+    /**
+     * Attempts fast backward navigation via `undo <uuid>.`
+     * 
+     * This is the Proof General-style undo: instead of N incremental undo commands
+     * or a full restart + replay, we send a single `undo <targetUuid>.` command
+     * to jump back to the target state.
+     * 
+     * @param targetStatementCount - Target number of statements after undo
+     * @param currentStatementCount - Current number of processed statements
+     * @param editor - The active text editor
+     * @returns Result of the undo attempt
+     */
+    private async tryUndoToState(
+        targetStatementCount: number,
+        currentStatementCount: number,
+        editor: vscode.TextEditor
+    ): Promise<StepResult> {
+        const targetUuid = this.undoStateTracker.getUndoTargetForBackwardJump(
+            currentStatementCount,
+            targetStatementCount
+        );
+        
+        if (targetUuid === undefined) {
+            return { 
+                success: false, 
+                error: 'No undo target available',
+                executionOffset: this.executionOffset
+            };
+        }
+        
+        this.log(`Attempting undo to uuid=${targetUuid} (target ${targetStatementCount} statements)`);
+        
+        // EasyCrypt `undo <uuid>.` command
+        // Source citation (EasyCrypt, commit 4fc8b636e76ee1689c97089282809532cc4d3c5c):
+        // - src/ec.ml: routes parsed `P_Undo i` to `EcCommands.undo i`
+        // - src/ecCommands.ml: implements `undo (olduuid : int)` by repeated `pop_context`
+        const undoCommand = `undo ${targetUuid}.`;
+        
+        try {
+            const output = await this.sendAndWait(undoCommand, editor.document.uri);
+            
+            // Check for errors
+            if (output.parsed.errors.length > 0) {
+                const errorMsg = output.parsed.errors[0]?.message || 'Undo command failed';
+                this.log(`Undo command returned error: ${errorMsg}`);
+                // Invalidate tracker since undo failed
+                return { 
+                    success: false, 
+                    error: errorMsg,
+                    output: output.raw,
+                    executionOffset: this.executionOffset
+                };
+            }
+            
+            // Verify the new uuid from the response prompt
+            const prompts = extractAllPrompts(output.raw ?? '');
+            if (prompts.length === 0) {
+                this.log(`Warning: No prompt in undo response, cannot verify uuid`);
+                // Proceed cautiously
+            } else {
+                const lastPrompt = prompts[prompts.length - 1];
+                const responseUuid = lastPrompt.promptInfo.uuid;
+                
+                if (responseUuid !== targetUuid) {
+                    this.log(`Undo uuid mismatch: expected ${targetUuid}, got ${responseUuid}`);
+                    // This is unexpected but not necessarily fatal
+                    // Continue and update tracker with actual uuid
+                }
+                
+                // Update tracker state
+                this.undoStateTracker.afterUndoSucceeded(targetStatementCount, responseUuid);
+            }
+            
+            // Success - update execution offset
+            const text = editor.document.getText();
+            this.statementIndex.update(text, editor.document.version);
+            const targetStatements = this.statementIndex.getStatementsUpTo(Infinity).slice(0, targetStatementCount);
+            
+            if (targetStatementCount === 0) {
+                this.executionOffset = 0;
+            } else if (targetStatements.length > 0) {
+                this.executionOffset = targetStatements[targetStatements.length - 1].endOffset;
+            } else {
+                this.executionOffset = 0;
+            }
+            
+            this.updateDecorations();
+            this._onDidChangePosition.fire(this.getExecutionPosition());
+            
+            // Update proof state
+            const progress = this.computeProgressSnapshot();
+            this.proofStateManager.handleProcessOutput(output, progress);
+            
+            this.log(`Undo succeeded, new offset: ${this.executionOffset}`);
+            
+            return {
+                success: true,
+                output: output.raw,
+                executionOffset: this.executionOffset
+            };
+            
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.log(`Undo command threw: ${msg}`);
+            return { 
+                success: false, 
+                error: msg,
+                executionOffset: this.executionOffset
+            };
         }
     }
 
@@ -591,6 +767,10 @@ export class StepManager implements vscode.Disposable {
                 this.executionOffset = statements[statements.length - 1].endOffset;
                 this.updateDecorations();
                 this._onDidChangePosition.fire(this.getExecutionPosition());
+                
+                // Rebuild undo state tracking from the batch output prompts
+                this.rebuildUndoStateFromBatch(batchedOutput.raw ?? '', statements.length);
+                
                 // End transaction with final output and progress
                 const progress = this.computeProgressSnapshot();
                 this.proofStateManager.endTransaction(tx, batchedOutput, progress);
@@ -603,9 +783,19 @@ export class StepManager implements vscode.Disposable {
             // Sequential fallback: re-run statements one by one so batch-only failures can recover.
             // We keep the already restarted process (single restart semantics).
             // UI suppression: still don't update verified range incrementally
+            // Track undo state during sequential replay
             let lastOutput: ProcessOutput | undefined;
             this.executionOffset = 0;
-            for (const statement of statements) {
+            // Reset undo tracker since we're starting fresh after failed batch
+            this.undoStateTracker.reset();
+            this.undoStateTracker.initialize(0);
+            
+            for (let i = 0; i < statements.length; i++) {
+                const statement = statements[i];
+                
+                // Track undo state: capture pre-state
+                this.undoStateTracker.beforeStatementSend(i);
+                
                 lastOutput = await this.sendAndWait(statement.text, editor.document.uri);
 
                 if (lastOutput.parsed.errors.length > 0) {
@@ -624,6 +814,13 @@ export class StepManager implements vscode.Disposable {
                         output: lastOutput.raw,
                         executionOffset: this.executionOffset
                     };
+                }
+                
+                // Track undo state: record post-state
+                const prompts = extractAllPrompts(lastOutput.raw ?? '');
+                if (prompts.length > 0) {
+                    const lastPrompt = prompts[prompts.length - 1];
+                    this.undoStateTracker.afterStatementProcessed(i, lastPrompt.promptInfo);
                 }
 
                 this.executionOffset = statement.endOffset;
@@ -665,6 +862,90 @@ export class StepManager implements vscode.Disposable {
     private async restartProcessForRecovery(): Promise<void> {
         await this.processManager.stopAndWait(4000);
         await this.processManager.start();
+        // Reset undo state tracker after process restart
+        this.undoStateTracker.initialize(0);
+    }
+
+    /**
+     * Rebuilds the undo state tracking from batch output prompts.
+     * 
+     * After a successful batch execution, we need to reconstruct the
+     * statement -> uuid mapping from the prompts in the output.
+     * 
+     * @param rawOutput - The raw batch output containing prompts
+     * @param statementCount - Number of statements in the batch
+     */
+    private rebuildUndoStateFromBatch(rawOutput: string, statementCount: number): void {
+        const prompts = extractAllPrompts(rawOutput);
+        
+        // Filter out the startup prompt [0|check]> if present
+        const responsePrompts = prompts.filter(p => p.promptInfo.uuid > 0);
+        
+        if (responsePrompts.length < statementCount) {
+            this.log(
+                `Warning: Not enough prompts to rebuild undo state. ` +
+                `Expected ${statementCount}, got ${responsePrompts.length}. ` +
+                `Undo-to-state will not be available for this session.`
+            );
+            // Don't invalidate - just don't update. The tracker was initialized at 0,
+            // and we can't reliably map statements to uuids.
+            return;
+        }
+        
+        // Build the mapping: for each statement i, preStateUuid[i] = uuid before statement i
+        // After the batch, we have prompts [1, 2, 3, ...] for statements [0, 1, 2, ...]
+        // So preStateUuid[0] = 0, preStateUuid[1] = 1, etc.
+        const promptInfos: PromptInfo[] = [];
+        for (let i = 0; i < statementCount; i++) {
+            promptInfos.push(responsePrompts[i].promptInfo);
+        }
+        
+        // Use afterBatchProcessed to update the tracker
+        const success = this.undoStateTracker.afterBatchProcessed(0, statementCount, promptInfos);
+        if (!success) {
+            this.log(`Failed to rebuild undo state from batch`);
+        } else {
+            this.log(`Successfully rebuilt undo state for ${statementCount} statements`);
+        }
+    }
+
+    /**
+     * Updates the undo state tracking from batch output prompts.
+     * 
+     * Unlike rebuildUndoStateFromBatch, this appends to the existing mapping
+     * rather than replacing it (used for forward batch stepping).
+     * 
+     * @param rawOutput - The raw batch output containing prompts
+     * @param startStatementIndex - The starting statement index
+     * @param statementCount - Number of statements in the batch
+     */
+    private updateUndoStateFromBatch(rawOutput: string, startStatementIndex: number, statementCount: number): void {
+        const prompts = extractAllPrompts(rawOutput);
+        
+        // Filter out the startup prompt [0|check]> if present
+        const responsePrompts = prompts.filter(p => p.promptInfo.uuid > 0);
+        
+        if (responsePrompts.length < statementCount) {
+            this.log(
+                `Warning: Not enough prompts to update undo state. ` +
+                `Expected ${statementCount}, got ${responsePrompts.length}.`
+            );
+            return;
+        }
+        
+        // Build the mapping for this batch
+        const promptInfos: PromptInfo[] = [];
+        for (let i = 0; i < statementCount; i++) {
+            promptInfos.push(responsePrompts[i].promptInfo);
+        }
+        
+        // Use afterBatchProcessed to update the tracker
+        const success = this.undoStateTracker.afterBatchProcessed(startStatementIndex, statementCount, promptInfos);
+        if (!success) {
+            this.log(`Failed to update undo state from batch`);
+        } else {
+            this.log(`Successfully updated undo state for ${statementCount} statements starting at index ${startStatementIndex}`);
+        }
     }
 
     /**
@@ -676,6 +957,9 @@ export class StepManager implements vscode.Disposable {
      * Uses StatementIndex for efficient cursor-to-statement mapping.
      * UI Suppression: For multi-statement operations, shows a "verifying" range
      * and updates the verified range only once at completion.
+     * 
+     * For backward navigation, first attempts fast undo-to-state if the
+     * UndoStateTracker has a valid mapping.
      * 
      * @returns Result of the operation
      */
@@ -702,11 +986,40 @@ export class StepManager implements vscode.Disposable {
         this.log(`Go to cursor: cursor=${cursorOffset}, current=${this.executionOffset}, target=${targetOffset}`);
         
         if (targetOffset <= this.executionOffset) {
-            // Backward navigation - use recovery
+            // Backward navigation
             if (targetOffset === this.executionOffset) {
                 // Already at target
                 return { success: true, executionOffset: this.executionOffset };
             }
+            
+            // Compute statement counts for undo-to-state
+            const currentStatements = this.statementIndex.getStatementsUpTo(this.executionOffset);
+            const targetStatements = this.statementIndex.getStatementsUpTo(targetOffset);
+            const currentCount = currentStatements.length;
+            const targetCount = targetStatements.length;
+            
+            // Try fast undo-to-state first
+            if (this.undoStateTracker.isValid() && this.processManager.isRunning()) {
+                this.log(`Backward goToCursor: trying fast undo-to-state (${currentCount} -> ${targetCount} statements)`);
+                this.stepping = true;
+                this._onDidStartStep.fire();
+                
+                try {
+                    const undoResult = await this.tryUndoToState(targetCount, currentCount, editor);
+                    if (undoResult.success) {
+                        this.log(`Fast undo-to-state succeeded for goToCursor`);
+                        this._onDidCompleteStep.fire(undoResult);
+                        return undoResult;
+                    }
+                    this.log(`Fast undo-to-state failed: ${undoResult.error}. Falling back to restart+replay.`);
+                } finally {
+                    this.stepping = false;
+                }
+            } else {
+                this.log(`Undo-to-state not available for goToCursor. Using restart+replay.`);
+            }
+            
+            // Fallback: use recovery
             this.log(`Backward goToCursor uses recovery to offset ${targetOffset}`);
             return await this.recoverState(targetOffset, editor);
         } else {
@@ -745,6 +1058,10 @@ export class StepManager implements vscode.Disposable {
             return await this.stepForward();
         }
         
+        // Get the starting statement index for undo tracking
+        const currentStatements = this.statementIndex.getStatementsUpTo(this.executionOffset);
+        const startStatementIndex = currentStatements.length;
+        
         // Multi-statement batch - use transaction for UI suppression
         this.stepping = true;
         this._onDidStartStep.fire();
@@ -759,13 +1076,15 @@ export class StepManager implements vscode.Disposable {
         );
         this.decorator.setVerifyingRange(editor, verifyingRange);
         
-        this.log(`Batch stepping forward: ${statements.length} statements to offset ${targetOffset}`);
+        this.log(`Batch stepping forward: ${statements.length} statements to offset ${targetOffset} (startIndex=${startStatementIndex})`);
         
         try {
             // Ensure process is running
             if (!this.processManager.isRunning()) {
                 try {
                     await this.processManager.start();
+                    // Initialize undo tracker when process starts
+                    this.undoStateTracker.initialize(0);
                 } catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
                     this.proofStateManager.failTransaction(tx, `Failed to start process: ${msg}`);
@@ -782,6 +1101,9 @@ export class StepManager implements vscode.Disposable {
                 this.executionOffset = statements[statements.length - 1].endOffset;
                 this.updateDecorations();
                 this._onDidChangePosition.fire(this.getExecutionPosition());
+                
+                // Update undo state tracking from the batch output
+                this.updateUndoStateFromBatch(batchedOutput.raw ?? '', startStatementIndex, statements.length);
 
                 // End transaction with final output and progress
                 const progress = this.computeProgressSnapshot();
@@ -800,10 +1122,15 @@ export class StepManager implements vscode.Disposable {
             this.log('Batched step produced an error; attempting sequential fallback.');
             
             // Sequential fallback - still with UI suppression (no intermediate decoration updates)
+            // Track undo state for each statement
             let lastOutput: ProcessOutput | undefined;
             let failedStatement: Statement | undefined;
+            let currentIndex = startStatementIndex;
             
             for (const statement of statements) {
+                // Track undo state: capture pre-state
+                this.undoStateTracker.beforeStatementSend(currentIndex);
+                
                 lastOutput = await this.sendAndWait(statement.text, editor.document.uri);
                 
                 if (lastOutput.parsed.errors.length > 0) {
@@ -811,7 +1138,15 @@ export class StepManager implements vscode.Disposable {
                     break;
                 }
                 
+                // Track undo state: record post-state
+                const prompts = extractAllPrompts(lastOutput.raw ?? '');
+                if (prompts.length > 0) {
+                    const lastPrompt = prompts[prompts.length - 1];
+                    this.undoStateTracker.afterStatementProcessed(currentIndex, lastPrompt.promptInfo);
+                }
+                
                 this.executionOffset = statement.endOffset;
+                currentIndex++;
             }
             
             // Update decorations once at the end
@@ -883,6 +1218,8 @@ export class StepManager implements vscode.Disposable {
         this.retracting = false;
         this.pendingRetractOffset = undefined;
         this.statementIndex.clear();
+        // Reset undo state tracker for fast backward navigation
+        this.undoStateTracker.reset();
         // Reset proof state with count=0 so the webview knows we have an active context
         this.proofStateManager.reset({ provedStatementCount: 0 });
         

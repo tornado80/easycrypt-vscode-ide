@@ -164,6 +164,7 @@ if (looksLikeFlag(command)) {
             // Built-in commands used by the extension.
             if (trimmed === 'reset.') {
                 writeLine('Session reset');
+                promptCounter = 1;
                 await emitPrompt();
                 lineNumber = 1;
                 return;
@@ -174,9 +175,33 @@ if (looksLikeFlag(command)) {
                     writeLine('[error-4-6]parse error');
                 } else {
                     writeLine('Undo successful');
+                    // Decrement prompt counter to simulate undo
+                    if (promptCounter > 1) {
+                        promptCounter--;
+                    }
                 }
                 await emitPrompt();
                 lineNumber++;
+                return;
+            }
+
+            // Support undo <uuid>. command for fast backward navigation
+            // Source citation (EasyCrypt, commit 4fc8b636e76ee1689c97089282809532cc4d3c5c):
+            // - src/ec.ml: routes parsed `P_Undo i` to `EcCommands.undo i`
+            // - src/ecCommands.ml: implements `undo (olduuid : int)` by repeated `pop_context`
+            const undoToStateMatch = trimmed.match(/^undo\s+(\d+)\.$/);
+            if (undoToStateMatch) {
+                const targetUuid = parseInt(undoToStateMatch[1], 10);
+                if (shouldFailUndo) {
+                    writeLine('[error-4-6]cannot undo (undo stack disabled)');
+                } else if (targetUuid < 0) {
+                    writeLine('[error-4-6]invalid undo target');
+                } else {
+                    // Set prompt counter to target uuid + 1 (emitPrompt increments after writing)
+                    promptCounter = targetUuid;
+                    writeLine(`Undo to state ${targetUuid}`);
+                }
+                await emitPrompt();
                 return;
             }
 

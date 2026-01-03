@@ -152,7 +152,7 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
     }
   });
 
-  it('stepBackward uses a single restart + one-shot batch replay', async function () {
+  it('stepBackward uses fast undo-to-state (no restart)', async function () {
     const { path: filePath, cleanup } = await createTempEcFile(
       [
         'require import A.',
@@ -186,24 +186,25 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
       assert.ok(typeof startsBefore === 'number');
       assert.ok(typeof sendsBefore === 'number');
 
-      // Backward stepping should restart once and replay the prefix in a single batched send.
+      // Backward stepping should use fast undo-to-state (single undo command, no restart).
       const back = await vscode.commands.executeCommand('easycrypt.stepBackward');
-      assert.ok(back && back.success, `Expected stepBackward success via recovery, got: ${JSON.stringify(back)}`);
+      assert.ok(back && back.success, `Expected stepBackward success via undo-to-state, got: ${JSON.stringify(back)}`);
       assert.ok(typeof back.executionOffset === 'number');
       assert.ok(back.executionOffset < before, `Expected executionOffset to decrease. Before=${before}, After=${back.executionOffset}`);
 
       const startsAfter = await vscode.commands.executeCommand('easycrypt._getProcessStartCount');
       const sendsAfter = await vscode.commands.executeCommand('easycrypt._getSendCommandCount');
 
+      // With undo-to-state, we expect NO restart (delta=0) and exactly one undo command
       assert.equal(
         startsAfter - startsBefore,
-        1,
-        `Expected exactly one process restart during stepBackward recovery; got delta=${startsAfter - startsBefore} (before=${startsBefore}, after=${startsAfter})`
+        0,
+        `Expected no process restart during stepBackward (undo-to-state); got delta=${startsAfter - startsBefore} (before=${startsBefore}, after=${startsAfter})`
       );
       assert.equal(
         sendsAfter - sendsBefore,
         1,
-        `Expected exactly one sendCommand() for batched replay; got delta=${sendsAfter - sendsBefore} (before=${sendsBefore}, after=${sendsAfter})`
+        `Expected exactly one sendCommand() for undo <uuid>.; got delta=${sendsAfter - sendsBefore} (before=${sendsBefore}, after=${sendsAfter})`
       );
     } finally {
       await vscode.commands.executeCommand('easycrypt.stopProcess');
@@ -211,7 +212,11 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
     }
   });
 
-  it('recovery falls back to sequential replay when one-shot batch fails', async function () {
+  it('stepBackward falls back to restart+replay when undo-to-state fails', async function () {
+    // Enable undo failure mode BEFORE spawning the process, so the mock
+    // sees the env var at startup and fails on undo commands.
+    process.env.MOCK_EC_UNDO_FAIL = '1';
+
     const { path: filePath, cleanup } = await createTempEcFile(
       [
         'require import A.',
@@ -232,10 +237,12 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
       await vscode.languages.setTextDocumentLanguage(doc, 'easycrypt');
       const editor = await vscode.window.showTextDocument(doc);
 
-      // Ensure a running REPL (awaited) before we establish a verified prefix.
+      // Stop any existing process and start a fresh one with MOCK_EC_UNDO_FAIL set.
+      await vscode.commands.executeCommand('easycrypt.stopProcess');
       await vscode.commands.executeCommand('easycrypt.startProcess');
 
-      // First, establish a non-zero verified prefix with normal mock behavior.
+      // First, establish a non-zero verified prefix.
+      // Forward stepping works normally even with MOCK_EC_UNDO_FAIL.
       editor.selection = new vscode.Selection(new vscode.Position(7, 0), new vscode.Position(7, 0));
       const forward = await vscode.commands.executeCommand('easycrypt.goToCursor');
       assert.ok(forward && forward.success, `Expected forward goToCursor success, got: ${JSON.stringify(forward)}`);
@@ -243,16 +250,13 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
       const before = await vscode.commands.executeCommand('easycrypt._getExecutionOffset');
       assert.ok(before > 0);
 
-      // Enable batch-only failure mode for the next spawned mock.
-      process.env.MOCK_EC_FAIL_RAPID_BATCH = '1';
-
       const startsBefore = await vscode.commands.executeCommand('easycrypt._getProcessStartCount');
       const sendsBefore = await vscode.commands.executeCommand('easycrypt._getSendCommandCount');
 
-      // Backward step triggers recovery (restart + replay). The one-shot batch attempt
-      // should fail, then StepManager should fall back to sequential replay and succeed.
+      // Backward step first tries undo-to-state, which should fail due to MOCK_EC_UNDO_FAIL,
+      // then falls back to restart + replay.
       const back = await vscode.commands.executeCommand('easycrypt.stepBackward');
-      assert.ok(back && back.success, `Expected stepBackward success via sequential fallback, got: ${JSON.stringify(back)}`);
+      assert.ok(back && back.success, `Expected stepBackward success via fallback to restart+replay, got: ${JSON.stringify(back)}`);
 
       const after = await vscode.commands.executeCommand('easycrypt._getExecutionOffset');
       assert.ok(after < before, `Expected executionOffset to decrease. Before=${before}, After=${after}`);
@@ -260,17 +264,19 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
       const startsAfter = await vscode.commands.executeCommand('easycrypt._getProcessStartCount');
       const sendsAfter = await vscode.commands.executeCommand('easycrypt._getSendCommandCount');
 
+      // When undo fails, we should fall back to restart + replay.
+      // We expect exactly one restart during the fallback.
       assert.equal(
         startsAfter - startsBefore,
         1,
-        `Expected exactly one restart during recovery; got delta=${startsAfter - startsBefore}`
+        `Expected exactly one restart during fallback recovery; got delta=${startsAfter - startsBefore}`
       );
 
-      // One-shot batch attempt (1) + sequential replay (>= 1) => must be > 1.
+      // One failed undo attempt (1) + one batch replay after restart (1) => at least 2.
       const deltaSends = sendsAfter - sendsBefore;
-      assert.ok(deltaSends > 1, `Expected >1 sendCommand() due to fallback; got delta=${deltaSends}`);
+      assert.ok(deltaSends >= 2, `Expected >=2 sendCommand() due to undo attempt + replay; got delta=${deltaSends}`);
     } finally {
-      delete process.env.MOCK_EC_FAIL_RAPID_BATCH;
+      delete process.env.MOCK_EC_UNDO_FAIL;
       await vscode.commands.executeCommand('easycrypt.stopProcess');
       await cleanup();
     }
@@ -317,10 +323,9 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
     }
   });
 
-  it('backward goToCursor performs a single restart (regression)', async function () {
-    // This test captures the historical O(k*n) regression where jumping backward
-    // would loop over stepBackward() and, when undo is unsupported, trigger a full
-    // stop/start recovery for each intermediate statement.
+  it('backward goToCursor uses fast undo-to-state (no restart)', async function () {
+    // This test verifies that backward goToCursor uses fast undo-to-state
+    // instead of the historical restart+replay approach.
 
     // Ensure a running REPL (awaited). This avoids races with stopProcess.
     await vscode.commands.executeCommand('easycrypt.startProcess');
@@ -359,8 +364,8 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
       const sendsBefore = await vscode.commands.executeCommand('easycrypt._getSendCommandCount');
       assert.ok(typeof sendsBefore === 'number', `Expected numeric send counter, got: ${sendsBefore}`);
 
-      // Now jump far backward (near the top). Optimized implementation should do
-      // exactly one recovery (single stop/start) and a single batched replay.
+      // Now jump far backward (near the top). With undo-to-state, this should
+      // send a single undo <uuid>. command with NO restart.
       editor.selection = new vscode.Selection(new vscode.Position(1, 0), new vscode.Position(1, 0));
 
       const backward = await vscode.commands.executeCommand('easycrypt.goToCursor');
@@ -373,17 +378,19 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
       assert.ok(typeof sendsAfter === 'number', `Expected numeric send counter, got: ${sendsAfter}`);
 
       const deltaStarts = startsAfter - startsBefore;
+      // With undo-to-state, we expect NO restart (delta=0)
       assert.equal(
         deltaStarts,
-        1,
-        `Expected exactly one process restart/start during backward goToCursor recovery; got delta=${deltaStarts} (before=${startsBefore}, after=${startsAfter})`
+        0,
+        `Expected no process restart during backward goToCursor (undo-to-state); got delta=${deltaStarts} (before=${startsBefore}, after=${startsAfter})`
       );
 
       const deltaSends = sendsAfter - sendsBefore;
+      // One undo <uuid>. command
       assert.equal(
         deltaSends,
         1,
-        `Expected exactly one sendCommand() for backward goToCursor replay; got delta=${deltaSends} (before=${sendsBefore}, after=${sendsAfter})`
+        `Expected exactly one sendCommand() for backward goToCursor (undo <uuid>.); got delta=${deltaSends} (before=${sendsBefore}, after=${sendsAfter})`
       );
     } finally {
       await vscode.commands.executeCommand('easycrypt.stopProcess');
