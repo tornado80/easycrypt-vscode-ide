@@ -29,9 +29,17 @@
           "begin": "\\(\\*",
           "end": "\\*\\)",
           "patterns": [
-            { "include": "#comments" }
+            { "include": "#nested-comment" }
           ]
         }
+      ]
+    },
+    "nested-comment": {
+      "name": "comment.block.easycrypt",
+      "begin": "\\(\\*",
+      "end": "\\*\\)",
+      "patterns": [
+        { "include": "#nested-comment" }
       ]
     },
     "strings": {
