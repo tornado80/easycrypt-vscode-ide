@@ -96,6 +96,77 @@ describe('StatementParser', function() {
             assert.strictEqual(stmt.endOffset, 44);
         });
 
+        it('handles nested block comments correctly', function() {
+            // The inner (* *) should NOT close the outer comment
+            const text = '(* outer (* inner *) outer *) lemma test.';
+            const stmt = findNextStatement(text, 0);
+            
+            assert.ok(stmt, 'Expected a statement to be found');
+            assert.strictEqual(stmt.text, '(* outer (* inner *) outer *) lemma test.');
+            assert.strictEqual(stmt.endOffset, text.length);
+        });
+
+        it('handles deeply nested block comments', function() {
+            // Three levels of nesting
+            const text = '(* level1 (* level2 (* level3 *) level2 *) level1 *) qed.';
+            const stmt = findNextStatement(text, 0);
+            
+            assert.ok(stmt, 'Expected a statement to be found');
+            assert.strictEqual(stmt.text, '(* level1 (* level2 (* level3 *) level2 *) level1 *) qed.');
+            assert.strictEqual(stmt.endOffset, text.length);
+        });
+
+        it('period inside nested comment does not terminate statement', function() {
+            // The period inside the nested comment should be ignored
+            const text = '(* outer (* inner. has a period *) outer *) lemma test.';
+            const stmt = findNextStatement(text, 0);
+            
+            assert.ok(stmt, 'Expected a statement to be found');
+            assert.ok(stmt.text.includes('lemma test'), 'Statement should include the lemma');
+            assert.strictEqual(stmt.endOffset, text.length);
+        });
+
+        it('regression: ambient-logic.ec nested comment example', function() {
+            // This is the exact pattern from ambient-logic.ec that caused the timeout
+            // The (* *) inside the outer comment is itself a nested comment
+            const text = [
+                '(*',
+                '() - Parentheses for binary operators.',
+                'Notice the extra space for the "*" operator.',
+                'We need that since (* *) also indicates comments.',
+                '*)',
+                '',
+                'search (+) (=) (=>).'
+            ].join('\n');
+            
+            const stmts = getAllStatements(text);
+            
+            // The comment block itself has no period, so it's included with the next
+            // statement that has a period. This produces 1 statement.
+            // The key correctness property: the nested (* *) inside the comment
+            // does NOT prematurely close the outer comment, so we get the full text.
+            assert.strictEqual(stmts.length, 1, `Expected 1 statement, got ${stmts.length}`);
+            // The statement should include both the comment and the search command
+            assert.ok(stmts[0].text.includes('(* *)'), 'Statement should include nested comment marker');
+            assert.ok(stmts[0].text.includes('search (+) (=) (=>).'), 'Statement should include search command');
+        });
+
+        it('returns null for unterminated nested block comment', function() {
+            // Outer comment never closed (inner is closed but outer remains open)
+            const text = '(* outer (* inner *) still outer';
+            const stmt = findNextStatement(text, 0);
+            
+            assert.strictEqual(stmt, null, 'Should return null for unterminated comment');
+        });
+
+        it('handles consecutive nested comments', function() {
+            const text = '(* first (* nested *) *) (* second (* nested *) *) qed.';
+            const stmt = findNextStatement(text, 0);
+            
+            assert.ok(stmt, 'Expected a statement to be found');
+            assert.strictEqual(stmt.endOffset, text.length);
+        });
+
         it('ignores periods in string literals', function() {
             const text = 'op x = "hello.world". lemma test.';
             const stmt = findNextStatement(text, 0);
@@ -267,6 +338,80 @@ describe('StatementParser', function() {
             const text = 'a. b. c. d.';
             const count = countStatements(text, 3, 8);
             assert.strictEqual(count, 2);
+        });
+    });
+
+    describe('nested comments regression (ambient-logic.ec)', function() {
+        
+        it('parses statements past the nested comment region in ambient-logic.ec', function() {
+            // Read the actual test fixture file
+            const fixturePath = path.join(__dirname, 'ambient-logic.ec');
+            const text = fs.readFileSync(fixturePath, 'utf8');
+            
+            // The nested comment region is around lines 229-233 (0-indexed ~228-232)
+            // which contains: "We need that since (* *) also indicates comments."
+            // 
+            // Find the offset of that comment block
+            const nestedCommentMarker = 'We need that since (* *) also indicates comments.';
+            const markerOffset = text.indexOf(nestedCommentMarker);
+            assert.ok(markerOffset > 0, 'Should find the nested comment marker in the file');
+            
+            // Find the start of the comment block containing this text
+            // Search backwards for the opening (*
+            let commentStart = text.lastIndexOf('(*', markerOffset);
+            assert.ok(commentStart > 0, 'Should find the opening (* of the comment block');
+            
+            // Get all statements starting from before the comment block
+            const stmtsBefore = getAllStatements(text, 0, commentStart);
+            const lastStmtBeforeComment = stmtsBefore.length > 0 ? stmtsBefore[stmtsBefore.length - 1] : null;
+            const startOffset = lastStmtBeforeComment ? lastStmtBeforeComment.endOffset : 0;
+            
+            // Now get statements starting from that point
+            const stmtsFromNested = getAllStatements(text, startOffset);
+            
+            // There should be many statements after the nested comment region
+            // The file has ~440 lines with many statements
+            assert.ok(stmtsFromNested.length > 10, 
+                `Expected many statements after the nested comment, got ${stmtsFromNested.length}`);
+            
+            // Verify we can find statements that come after the nested comment region
+            // For example, "search (+) (=) (=>)." comes right after the nested comment block
+            const searchStmt = stmtsFromNested.find(s => s.text.includes('search (+) (=) (=>)'));
+            assert.ok(searchStmt, 'Should find the search statement after the nested comment block');
+        });
+        
+        it('does not produce statements with unterminated comments from ambient-logic.ec', function() {
+            // Read the actual test fixture file
+            const fixturePath = path.join(__dirname, 'ambient-logic.ec');
+            const text = fs.readFileSync(fixturePath, 'utf8');
+            
+            // Get all statements
+            const allStmts = getAllStatements(text);
+            
+            // Verify that no statement starts with (* and does not end with *)
+            // (unless it's a statement that genuinely starts with a comment and has code after)
+            for (const stmt of allStmts) {
+                const trimmed = stmt.text.trim();
+                
+                // Count (* and *) in the statement
+                let depth = 0;
+                let i = 0;
+                while (i < trimmed.length - 1) {
+                    if (trimmed[i] === '(' && trimmed[i + 1] === '*') {
+                        depth++;
+                        i += 2;
+                    } else if (trimmed[i] === '*' && trimmed[i + 1] === ')') {
+                        depth--;
+                        i += 2;
+                    } else {
+                        i++;
+                    }
+                }
+                
+                // At the end of a valid statement, comment depth should be 0
+                assert.strictEqual(depth, 0, 
+                    `Statement has unbalanced comments (depth=${depth}): "${trimmed.substring(0, 100)}..."`);
+            }
         });
     });
 });

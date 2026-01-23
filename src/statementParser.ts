@@ -25,9 +25,17 @@ export interface Statement {
  * 
  * Note: EasyCrypt uses (* ... *) for comments. The // token is NOT a comment
  * introducer; it is an ssreflect-style tactic token (e.g., `=> //.`, `//=`).
+ * 
+ * EasyCrypt block comments are **nestable**: `(* outer (* inner *) outer *)`.
+ * We track comment nesting depth rather than a simple boolean to handle this correctly.
  */
 interface ScanState {
-    inBlockComment: boolean;
+    /** 
+     * Nesting depth of block comments. 
+     * 0 = not in a comment; >0 = inside nested comments.
+     * Must never become negative.
+     */
+    blockCommentDepth: number;
     inString: boolean;
     stringChar: string;
 }
@@ -54,7 +62,7 @@ export function findNextStatement(text: string, startOffset: number): Statement 
     
     const statementStart = i;
     const state: ScanState = {
-        inBlockComment: false,
+        blockCommentDepth: 0,
         inString: false,
         stringChar: ''
     };
@@ -64,8 +72,8 @@ export function findNextStatement(text: string, startOffset: number): Statement 
         const nextChar = i + 1 < len ? text[i + 1] : '';
         const nextNextChar = i + 2 < len ? text[i + 2] : '';
         
-        // Handle string literals
-        if (!state.inBlockComment) {
+        // Handle string literals (only when not inside a block comment)
+        if (state.blockCommentDepth === 0) {
             if (state.inString) {
                 if (char === state.stringChar && text[i - 1] !== '\\') {
                     state.inString = false;
@@ -85,27 +93,31 @@ export function findNextStatement(text: string, startOffset: number): Statement 
         }
         
         // Handle comments
-        // Note: EasyCrypt uses only (* ... *) for comments.
+        // Note: EasyCrypt uses only (* ... *) for comments, and they are NESTABLE.
         // The // token is NOT a comment; it is an ssreflect-style tactic token
         // (e.g., `=> //.`, `//=`). Do not treat // as a line comment.
         if (!state.inString) {
             // Block comment start: (*
+            // This works both when entering a new comment (depth 0 -> 1) and
+            // when entering a nested comment (depth N -> N+1).
             if (char === '(' && nextChar === '*') {
-                state.inBlockComment = true;
+                state.blockCommentDepth++;
                 i += 2;
                 continue;
             }
             
             // Block comment end: *)
-            if (char === '*' && nextChar === ')' && state.inBlockComment) {
-                state.inBlockComment = false;
+            // Only decrement if we are inside a comment (depth > 0).
+            // If depth is already 0, treat *) as ordinary text (do not go negative).
+            if (char === '*' && nextChar === ')' && state.blockCommentDepth > 0) {
+                state.blockCommentDepth--;
                 i += 2;
                 continue;
             }
         }
         
         // Check for statement terminator (period not in comment/string)
-        if (char === '.' && !state.inBlockComment && !state.inString) {
+        if (char === '.' && state.blockCommentDepth === 0 && !state.inString) {
             // Check it's not part of a number (e.g., 1.5)
             const prevChar = i > 0 ? text[i - 1] : '';
             if (!/\d/.test(prevChar) || !/\d/.test(nextChar)) {
