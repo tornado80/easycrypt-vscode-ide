@@ -18,6 +18,7 @@ function run() {
   mocha.addFile(path.resolve(testsRoot, 'proofNavigation.e2e.test.js'));
   mocha.addFile(path.resolve(testsRoot, 'proofNavigation.real.e2e.test.js'));
   mocha.addFile(path.resolve(testsRoot, 'proofNavigationButtons.e2e.test.js'));
+  mocha.addFile(path.resolve(testsRoot, 'perFileSessionIsolation.e2e.test.js'));
 
   return new Promise((resolve, reject) => {
     mocha.run((failures) => {

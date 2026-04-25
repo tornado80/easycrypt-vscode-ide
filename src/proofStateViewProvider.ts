@@ -12,7 +12,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ProofStateManager, ProofState } from './proofStateManager';
+import { ProofState } from './proofStateManager';
 import { Logger } from './logger';
 
 /**
@@ -79,8 +79,7 @@ export type ExtensionToWebviewMessage = { type: 'updateState'; state: Serialized
  * 
  * @example
  * ```typescript
- * const stateManager = new ProofStateManager();
- * const viewProvider = new ProofStateViewProvider(context.extensionUri, stateManager);
+ * const viewProvider = new ProofStateViewProvider(context.extensionUri);
  * context.subscriptions.push(
  *     vscode.window.registerWebviewViewProvider(PROOF_STATE_VIEW_ID, viewProvider)
  * );
@@ -89,6 +88,15 @@ export type ExtensionToWebviewMessage = { type: 'updateState'; state: Serialized
 export class ProofStateViewProvider implements vscode.WebviewViewProvider {
     /** The webview view instance */
     private _view?: vscode.WebviewView;
+
+    /** The currently projected proof state */
+    private currentState: ProofState = {
+        goals: [],
+        messages: [],
+        isProcessing: false,
+        isComplete: false,
+        outputLines: []
+    };
 
     /** Whether we are currently in a processing window (UI suppression) */
     private inProcessingWindow = false;
@@ -112,20 +120,17 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
      * Creates a new ProofStateViewProvider
      * 
      * @param extensionUri - The URI of the extension directory
-     * @param stateManager - The proof state manager to subscribe to
      */
-    constructor(
-        extensionUri: vscode.Uri,
-        private readonly stateManager: ProofStateManager
-    ) {
+    constructor(extensionUri: vscode.Uri) {
         this._mediaPath = vscode.Uri.joinPath(extensionUri, 'media', 'proofStateView');
+    }
 
-        // Subscribe to state changes
-        this._disposables.push(
-            this.stateManager.onDidChangeState(event => {
-                this.updateView(event.state);
-            })
-        );
+    /**
+     * Updates the currently projected state source.
+     */
+    public setDisplayedState(state: ProofState): void {
+        this.currentState = state;
+        this.updateView(state);
     }
 
     /**
@@ -157,7 +162,7 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
         // Update view when it becomes visible
         webviewView.onDidChangeVisibility(() => {
             if (webviewView.visible) {
-                this.updateView(this.stateManager.state);
+                this.updateView(this.currentState);
             }
         }, undefined, this._disposables);
     }
@@ -288,7 +293,7 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
         switch (message.type) {
             case 'ready':
                 // Webview is ready, send current state
-                this.updateView(this.stateManager.state);
+                this.updateView(this.currentState);
                 break;
             case 'nav':
                 this.handleNavigationAction(message.action);
@@ -302,8 +307,8 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
      */
     private async handleNavigationAction(action: ProofStateViewNavAction): Promise<void> {
         const logger = this.tryGetLogger();
-        const isProcessing = this.stateManager.state.isProcessing;
-        const hasContext = !!this.stateManager.state.progress;
+        const isProcessing = this.currentState.isProcessing;
+        const hasContext = !!this.currentState.progress;
 
         // Log the toolbar click (verbose only)
         logger?.event('toolbar-nav-click', {

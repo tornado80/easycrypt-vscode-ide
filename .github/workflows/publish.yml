@@ -83,4 +83,4 @@ jobs:
             echo "Missing VSCODE_MARKET_PAT secret." >&2
             exit 1
           fi
-          npx --yes vsce publish -p "${VSCE_PAT}" -i "${{ steps.vsix.outputs.path }}"
+          npx --yes @vscode/vsce@3.9.1 publish -p "${VSCE_PAT}" -i "${{ steps.vsix.outputs.path }}"

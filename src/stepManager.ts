@@ -15,7 +15,6 @@
 import * as vscode from 'vscode';
 import { ProcessManager, ProcessOutput } from './processManager';
 import { ProofStateManager, ProofProgressSnapshot } from './proofStateManager';
-import { EditorDecorator } from './editorDecorator';
 import { ConfigurationManager } from './configurationManager';
 import { findNextStatement, findPreviousStatementEnd, Statement } from './statementParser';
 import { StatementIndex } from './statementIndex';
@@ -55,6 +54,19 @@ export interface StepManagerEvents {
     onDidStartStep: vscode.Event<void>;
     /** Fired when stepping completes */
     onDidCompleteStep: vscode.Event<StepResult>;
+}
+
+/**
+ * Decoration sink used by StepManager.
+ *
+ * This keeps step/navigation logic independent of how decoration state is
+ * projected across editors (single-file vs per-file session projection).
+ */
+export interface StepDecorationSink {
+    setVerifiedRange(editor: vscode.TextEditor, range: vscode.Range | undefined): void;
+    setProcessingRange(editor: vscode.TextEditor, range: vscode.Range | undefined): void;
+    setVerifyingRange(editor: vscode.TextEditor, range: vscode.Range | undefined): void;
+    clearAll(editor: vscode.TextEditor): void;
 }
 
 /**
@@ -131,7 +143,7 @@ export class StepManager implements vscode.Disposable {
     constructor(
         private readonly processManager: ProcessManager,
         private readonly proofStateManager: ProofStateManager,
-        private readonly decorator: EditorDecorator,
+        private readonly decorator: StepDecorationSink,
         private readonly configManager: ConfigurationManager,
         outputChannel?: vscode.OutputChannel
     ) {

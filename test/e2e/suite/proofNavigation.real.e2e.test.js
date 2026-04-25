@@ -59,73 +59,71 @@ async function waitForNoErrorDiagnostics(uri, timeoutMs = 20_000) {
 describe('Interactive Proof Navigation E2E (real easycrypt)', function () {
   this.timeout(240_000);
 
-  it('PRG.ec goToCursor then stepBackward preserves final tail output in proof state snapshot', async function () {
-    // This test is intentionally opt-in: it requires a real EasyCrypt binary and
-    // is too heavyweight / environment-specific for default CI runs.
-    const easycryptPath = process.env.EASYCRYPT_REAL_PATH;
-    if (!easycryptPath) {
-      this.skip();
-      return;
-    }
+  const optInPrgRecoveryEasycryptPath = process.env.EASYCRYPT_REAL_PATH;
 
-    await configureRealEasyCrypt(easycryptPath);
+  if (optInPrgRecoveryEasycryptPath) {
+    it('PRG.ec goToCursor then stepBackward preserves final tail output in proof state snapshot', async function () {
+      const easycryptPath = optInPrgRecoveryEasycryptPath;
 
-    const ext = vscode.extensions.getExtension('tornado.easycrypt-vscode');
-    assert.ok(ext, 'Extension tornado.easycrypt-vscode should be present');
-    await ext.activate();
+      await configureRealEasyCrypt(easycryptPath);
 
-    const prgPath = path.resolve(__dirname, '..', '..', '..', 'test', 'PRG.ec');
-    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(prgPath));
-    await vscode.languages.setTextDocumentLanguage(doc, 'easycrypt');
-    const editor = await vscode.window.showTextDocument(doc);
+      const ext = vscode.extensions.getExtension('tornado.easycrypt-vscode');
+      assert.ok(ext, 'Extension tornado.easycrypt-vscode should be present');
+      await ext.activate();
 
-    try {
-      // Start from a known state.
-      await vscode.commands.executeCommand('easycrypt.resetProof');
+      const prgPath = path.resolve(__dirname, '..', '..', '..', 'test', 'PRG.ec');
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(prgPath));
+      await vscode.languages.setTextDocumentLanguage(doc, 'easycrypt');
+      const editor = await vscode.window.showTextDocument(doc);
 
-      // Repro setup: place the cursor *inside* the statement right after `inv`.
-      // In test/PRG.ec, `local lemma Plog_Psample ...` starts at ~6195 and ends at 6367.
-      // Using positionAt avoids depending on exact line numbers.
-      const targetPos = doc.positionAt(6205);
-      editor.selection = new vscode.Selection(targetPos, targetPos);
+      try {
+        // Start from a known state.
+        await vscode.commands.executeCommand('easycrypt.resetProof');
 
-      const forward = await vscode.commands.executeCommand('easycrypt.goToCursor');
-      assert.ok(forward && forward.success, `Expected goToCursor success, got: ${JSON.stringify(forward)}`);
-      assert.ok(typeof forward.executionOffset === 'number' && forward.executionOffset > 0, 'Expected goToCursor to return an executionOffset');
-      assert.equal(
-        forward.executionOffset,
-        6367,
-        `Expected goToCursor to land at end of Plog_Psample (6367). got=${forward.executionOffset}`
-      );
+        // Repro setup: place the cursor *inside* the statement right after `inv`.
+        // In test/PRG.ec, `local lemma Plog_Psample ...` starts at ~6195 and ends at 6367.
+        // Using positionAt avoids depending on exact line numbers.
+        const targetPos = doc.positionAt(6205);
+        editor.selection = new vscode.Selection(targetPos, targetPos);
 
-      const back = await vscode.commands.executeCommand('easycrypt.stepBackward');
-      assert.ok(back && back.success, `Expected stepBackward success, got: ${JSON.stringify(back)}`);
-      assert.ok(typeof back.executionOffset === 'number' && back.executionOffset > 0, 'Expected stepBackward to return an executionOffset');
+        const forward = await vscode.commands.executeCommand('easycrypt.goToCursor');
+        assert.ok(forward && forward.success, `Expected goToCursor success, got: ${JSON.stringify(forward)}`);
+        assert.ok(typeof forward.executionOffset === 'number' && forward.executionOffset > 0, 'Expected goToCursor to return an executionOffset');
+        assert.equal(
+          forward.executionOffset,
+          6367,
+          `Expected goToCursor to land at end of Plog_Psample (6367). got=${forward.executionOffset}`
+        );
 
-      // The known statement boundary in test/PRG.ec: inv statement ends at offset 6191.
-      // This matches the user repro where stepBackward triggers recovery + replay to this point.
-      assert.equal(
-        back.executionOffset,
-        6191,
-        `Expected stepBackward to land on inv statement end (6191). goToCursor=${forward.executionOffset}, stepBackward=${back.executionOffset}`
-      );
+        const back = await vscode.commands.executeCommand('easycrypt.stepBackward');
+        assert.ok(back && back.success, `Expected stepBackward success, got: ${JSON.stringify(back)}`);
+        assert.ok(typeof back.executionOffset === 'number' && back.executionOffset > 0, 'Expected stepBackward to return an executionOffset');
 
-      const snapshot = await waitForProofStateSettled(180_000);
-      assert.ok(snapshot, 'Expected proof state snapshot after recovery');
-      assert.equal(snapshot.isProcessing, false, 'Expected proof state to be settled');
+        // The known statement boundary in test/PRG.ec: inv statement ends at offset 6191.
+        // This matches the user repro where stepBackward triggers recovery + replay to this point.
+        assert.equal(
+          back.executionOffset,
+          6191,
+          `Expected stepBackward to land on inv statement end (6191). goToCursor=${forward.executionOffset}, stepBackward=${back.executionOffset}`
+        );
 
-      const text = Array.isArray(snapshot.outputLines) ? snapshot.outputLines.join('\n') : '';
+        const snapshot = await waitForProofStateSettled(180_000);
+        assert.ok(snapshot, 'Expected proof state snapshot after recovery');
+        assert.equal(snapshot.isProcessing, false, 'Expected proof state to be settled');
 
-      // This marker is the specific tail output from the reported repro.
-      // Accept a stable substring to reduce version sensitivity.
-      assert.ok(
-        /added predicate\s+inv/i.test(text),
-        `Expected final tail output to include "added predicate inv". Got:\n${text.slice(-2000)}`
-      );
-    } finally {
-      await vscode.commands.executeCommand('easycrypt.stopProcess');
-    }
-  });
+        const text = Array.isArray(snapshot.outputLines) ? snapshot.outputLines.join('\n') : '';
+
+        // This marker is the specific tail output from the reported repro.
+        // Accept a stable substring to reduce version sensitivity.
+        assert.ok(
+          /added predicate\s+inv/i.test(text),
+          `Expected final tail output to include "added predicate inv". Got:\n${text.slice(-2000)}`
+        );
+      } finally {
+        await vscode.commands.executeCommand('easycrypt.stopProcess');
+      }
+    });
+  }
 
   it('KEMDEM_lor.ec check and stepping remain import-resolved across directory switch', async function () {
     const easycryptPath = await resolveEasycryptPath();

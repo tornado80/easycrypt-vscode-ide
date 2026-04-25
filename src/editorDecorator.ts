@@ -52,20 +52,8 @@ export class EditorDecorator implements vscode.Disposable {
     /** Decoration type for verifying region (batch operations) */
     private verifyingDecorationType: vscode.TextEditorDecorationType;
     
-    /** Current verified range */
-    private verifiedRange: vscode.Range | undefined;
-    
-    /** Current processing range */
-    private processingRange: vscode.Range | undefined;
-    
-    /** Current verifying range (for batch operations) */
-    private verifyingRange: vscode.Range | undefined;
-    
     /** Configuration */
     private config: Required<DecorationConfig>;
-    
-    /** Disposables */
-    private disposables: vscode.Disposable[] = [];
 
     /**
      * Creates a new EditorDecorator
@@ -94,15 +82,6 @@ export class EditorDecorator implements vscode.Disposable {
             overviewRulerColor: 'rgba(100, 149, 237, 0.5)',
             overviewRulerLane: vscode.OverviewRulerLane.Center
         });
-        
-        // Listen for editor changes to reapply decorations
-        this.disposables.push(
-            vscode.window.onDidChangeActiveTextEditor(editor => {
-                if (editor) {
-                    this.reapplyDecorations(editor);
-                }
-            })
-        );
     }
 
     /**
@@ -112,8 +91,6 @@ export class EditorDecorator implements vscode.Disposable {
      * @param range - The range to mark as verified, or undefined to clear
      */
     public setVerifiedRange(editor: vscode.TextEditor, range: vscode.Range | undefined): void {
-        this.verifiedRange = range;
-        
         if (range) {
             editor.setDecorations(this.verifiedDecorationType, [range]);
         } else {
@@ -128,8 +105,6 @@ export class EditorDecorator implements vscode.Disposable {
      * @param range - The range being processed, or undefined to clear
      */
     public setProcessingRange(editor: vscode.TextEditor, range: vscode.Range | undefined): void {
-        this.processingRange = range;
-        
         if (range) {
             editor.setDecorations(this.processingDecorationType, [range]);
         } else {
@@ -147,8 +122,6 @@ export class EditorDecorator implements vscode.Disposable {
      * @param range - The range being verified, or undefined to clear
      */
     public setVerifyingRange(editor: vscode.TextEditor, range: vscode.Range | undefined): void {
-        this.verifyingRange = range;
-        
         if (range) {
             editor.setDecorations(this.verifyingDecorationType, [range]);
         } else {
@@ -162,49 +135,9 @@ export class EditorDecorator implements vscode.Disposable {
      * @param editor - The text editor
      */
     public clearAll(editor: vscode.TextEditor): void {
-        this.verifiedRange = undefined;
-        this.processingRange = undefined;
-        this.verifyingRange = undefined;
         editor.setDecorations(this.verifiedDecorationType, []);
         editor.setDecorations(this.processingDecorationType, []);
         editor.setDecorations(this.verifyingDecorationType, []);
-    }
-
-    /**
-     * Reapplies decorations to an editor (e.g., when switching tabs)
-     * 
-     * @param editor - The text editor
-     */
-    private reapplyDecorations(editor: vscode.TextEditor): void {
-        if (editor.document.languageId !== 'easycrypt') {
-            return;
-        }
-        
-        if (this.verifiedRange) {
-            editor.setDecorations(this.verifiedDecorationType, [this.verifiedRange]);
-        }
-        
-        if (this.processingRange) {
-            editor.setDecorations(this.processingDecorationType, [this.processingRange]);
-        }
-        
-        if (this.verifyingRange) {
-            editor.setDecorations(this.verifyingDecorationType, [this.verifyingRange]);
-        }
-    }
-
-    /**
-     * Gets the current verified range
-     */
-    public getVerifiedRange(): vscode.Range | undefined {
-        return this.verifiedRange;
-    }
-
-    /**
-     * Gets the current verifying range
-     */
-    public getVerifyingRange(): vscode.Range | undefined {
-        return this.verifyingRange;
     }
 
     /**
@@ -214,6 +147,5 @@ export class EditorDecorator implements vscode.Disposable {
         this.verifiedDecorationType.dispose();
         this.processingDecorationType.dispose();
         this.verifyingDecorationType.dispose();
-        this.disposables.forEach(d => d.dispose());
     }
 }

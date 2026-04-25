@@ -9,24 +9,24 @@
 
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import { ActiveProofStateBridge } from './activeProofStateBridge';
+import { DecorationProjectionService } from './decorationProjectionService';
 import { DiagnosticManager } from './diagnosticManager';
+import { EasyCryptFileSession } from './easyCryptFileSession';
 import { parseOutput } from './outputParser';
 import { 
     ConfigurationManager, 
     getConfigurationManager, 
     disposeConfigurationManager 
 } from './configurationManager';
-import { ProcessManager } from './processManager';
-import { ProofStateManager } from './proofStateManager';
 import { ProofStateViewProvider, PROOF_STATE_VIEW_ID } from './proofStateViewProvider';
-import { StepManager } from './stepManager';
 import { EditorDecorator } from './editorDecorator';
 import { Logger } from './logger';
+import { SessionCommandRouter } from './sessionCommandRouter';
+import { SessionRegistry } from './sessionRegistry';
 import {
-    SessionContextFingerprint,
     VerificationContext,
     buildCompileArgs,
-    fingerprintVerificationContext,
     resolveVerificationContext
 } from './verificationContextResolver';
 
@@ -36,23 +36,29 @@ let diagnosticManager: DiagnosticManager | undefined;
 /** The configuration manager instance */
 let configurationManager: ConfigurationManager | undefined;
 
-/** The process manager instance */
-let processManager: ProcessManager | undefined;
+/** Per-file session registry */
+let sessionRegistry: SessionRegistry<vscode.TextDocument, EasyCryptFileSession> | undefined;
 
-/** The proof state manager instance */
-let proofStateManager: ProofStateManager | undefined;
+/** Command router for active per-file sessions */
+let sessionCommandRouter: SessionCommandRouter<EasyCryptFileSession> | undefined;
 
 /** The proof state view provider instance */
 let proofStateViewProvider: ProofStateViewProvider | undefined;
 
+/** Bridges active session proof state into the single view provider */
+let activeProofStateBridge: ActiveProofStateBridge | undefined;
+
+/** Tracks proof-state subscriptions per session for instrumentation */
+const proofStateSubscriptionBySessionKey = new Map<string, vscode.Disposable>();
+
 /** Internal/testing: counts proof state change events */
 let proofStateChangeCount = 0;
 
-/** The step manager instance */
-let stepManager: StepManager | undefined;
-
 /** The editor decorator instance */
 let editorDecorator: EditorDecorator | undefined;
+
+/** URI-scoped decoration projection service */
+let decorationProjectionService: DecorationProjectionService | undefined;
 
 /** Output channel for logging */
 let outputChannel: vscode.OutputChannel | undefined;
@@ -95,13 +101,39 @@ function resolveVerificationContextForDocument(document: vscode.TextDocument): V
     });
 }
 
-function resolveSessionContextForDocument(document: vscode.TextDocument): SessionContextFingerprint | undefined {
-    const context = resolveVerificationContextForDocument(document);
-    if (!context) {
+function getActiveEasyCryptEditor(): vscode.TextEditor | undefined {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== 'easycrypt') {
         return undefined;
     }
 
-    return fingerprintVerificationContext(context);
+    return editor;
+}
+
+async function ensureActiveSessionForEditor(
+    editor: vscode.TextEditor | undefined
+): Promise<EasyCryptFileSession | undefined> {
+    if (!editor || editor.document.languageId !== 'easycrypt' || !sessionRegistry) {
+        return undefined;
+    }
+
+    return sessionRegistry.setActiveDocument(editor.document);
+}
+
+async function requireActiveSession(): Promise<EasyCryptFileSession | undefined> {
+    const editor = getActiveEasyCryptEditor();
+    if (!editor) {
+        vscode.window.showWarningMessage('Open an EasyCrypt file first');
+        return undefined;
+    }
+
+    const session = await ensureActiveSessionForEditor(editor);
+    if (!session) {
+        vscode.window.showErrorMessage('EasyCrypt: Failed to initialize file session');
+        return undefined;
+    }
+
+    return session;
 }
 
 /**
@@ -231,36 +263,91 @@ export function getDiagnosticManager(): DiagnosticManager | undefined {
  * Registers extension commands
  */
 function registerCommands(context: vscode.ExtensionContext): void {
-    // Command to clear all diagnostics
-    const clearAllDiagnostics = vscode.commands.registerCommand(
-        'easycrypt.clearAllDiagnostics',
-        () => {
+    const runRoutedStepCommand = async (
+        routedName: 'stepForward' | 'stepBackward' | 'goToCursor' | 'resetProof' | 'forceRecovery',
+        commandId: string,
+        run: (session: EasyCryptFileSession) => Promise<any>
+    ): Promise<any> => {
+        if (!sessionCommandRouter) {
+            vscode.window.showErrorMessage('EasyCrypt: Session command router not initialized');
+            return undefined;
+        }
+
+        const session = await requireActiveSession();
+        if (!session) {
+            return undefined;
+        }
+
+        const editor = getActiveEasyCryptEditor();
+        const cursorOffset = editor
+            ? editor.document.offsetAt(editor.selection.active)
+            : undefined;
+
+        logger?.command(commandId, {
+            sessionKey: session.key,
+            executionOffset: session.stepManager.getExecutionOffset(),
+            cursorOffset
+        });
+
+        try {
+            const result = await sessionCommandRouter.runOnActiveSession(
+                routedName,
+                async (activeSession, token) => {
+                    if (token.isCancellationRequested) {
+                        throw new Error('Command cancelled');
+                    }
+                    return run(activeSession);
+                }
+            );
+
+            logger?.commandComplete(commandId, Boolean(result?.success ?? true), {
+                sessionKey: session.key,
+                executionOffset: result?.executionOffset,
+                error: result?.error
+            });
+
+            if (result?.success === false && result.error) {
+                vscode.window.showWarningMessage(`EasyCrypt: ${result.error}`);
+            }
+
+            return result;
+        } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            logger?.commandComplete(commandId, false, {
+                sessionKey: session.key,
+                error: msg
+            });
+
+            if (msg !== 'No active EasyCrypt file') {
+                vscode.window.showWarningMessage(`EasyCrypt: ${msg}`);
+            }
+
+            return undefined;
+        }
+    };
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.clearAllDiagnostics', () => {
             if (diagnosticManager) {
                 diagnosticManager.clearAll();
                 log('Cleared all diagnostics');
                 vscode.window.showInformationMessage('EasyCrypt: Cleared all diagnostics');
             }
-        }
+        })
     );
-    context.subscriptions.push(clearAllDiagnostics);
 
-    // Command to clear diagnostics for current file
-    const clearFileDiagnostics = vscode.commands.registerCommand(
-        'easycrypt.clearFileDiagnostics',
-        () => {
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.clearFileDiagnostics', () => {
             const editor = vscode.window.activeTextEditor;
             if (editor && diagnosticManager) {
                 diagnosticManager.clearDiagnostics(editor.document.uri);
                 log(`Cleared diagnostics for ${editor.document.uri.fsPath}`);
             }
-        }
+        })
     );
-    context.subscriptions.push(clearFileDiagnostics);
 
-    // Command to show diagnostic count (for debugging/status bar)
-    const showDiagnosticCount = vscode.commands.registerCommand(
-        'easycrypt.showDiagnosticCount',
-        () => {
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.showDiagnosticCount', () => {
             const editor = vscode.window.activeTextEditor;
             if (editor && diagnosticManager) {
                 const counts = diagnosticManager.getDiagnosticCountsBySeverity(editor.document.uri);
@@ -268,45 +355,36 @@ function registerCommands(context: vscode.ExtensionContext): void {
                     `EasyCrypt Diagnostics: ${counts.errors} error(s), ${counts.warnings} warning(s)`
                 );
             }
-        }
+        })
     );
-    context.subscriptions.push(showDiagnosticCount);
 
-    // Development/testing command to simulate an error
-    const simulateError = vscode.commands.registerCommand(
-        'easycrypt.dev.simulateError',
-        async () => {
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.dev.simulateError', async () => {
             const editor = vscode.window.activeTextEditor;
             if (!editor || editor.document.languageId !== 'easycrypt') {
                 vscode.window.showWarningMessage('Open an EasyCrypt file first');
                 return;
             }
 
-            const line = editor.selection.active.line + 1; // Convert to 1-indexed
+            const line = editor.selection.active.line + 1;
             const col = editor.selection.active.character + 1;
-            
-            // Simulate an EasyCrypt error output
             const simulatedOutput = `[error-${line}-${col}] unknown symbol: test_symbol`;
-            
+
             const result = processEasyCryptOutput(editor.document.uri, simulatedOutput);
             if (result && result.errors.length > 0) {
-                vscode.window.showInformationMessage(
-                    `Simulated error at line ${line}, column ${col}`
-                );
+                vscode.window.showInformationMessage(`Simulated error at line ${line}, column ${col}`);
             }
-        }
+        })
     );
-    context.subscriptions.push(simulateError);
 
-    // Command to check the current file with EasyCrypt
-    const checkFile = vscode.commands.registerCommand(
-        'easycrypt.checkFile',
-        async () => {
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.checkFile', async () => {
             const editor = vscode.window.activeTextEditor;
-            logger?.command('easycrypt.checkFile', { 
+            logger?.command('easycrypt.checkFile', {
                 uri: editor?.document.uri.fsPath,
                 languageId: editor?.document.languageId
             });
+
             if (!editor || editor.document.languageId !== 'easycrypt') {
                 vscode.window.showWarningMessage('Open an EasyCrypt file first');
                 logger?.commandComplete('easycrypt.checkFile', false, { error: 'no active EasyCrypt file' });
@@ -315,317 +393,262 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
             await checkDocument(editor.document);
             logger?.commandComplete('easycrypt.checkFile', true, { uri: editor.document.uri.fsPath });
-        }
+        })
     );
-    context.subscriptions.push(checkFile);
 
-    // Command to start/restart the EasyCrypt process
-    const startProcess = vscode.commands.registerCommand(
-        'easycrypt.startProcess',
-        async () => {
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.startProcess', async () => {
             logger?.command('easycrypt.startProcess');
-            if (!processManager) {
-                vscode.window.showErrorMessage('EasyCrypt: Process manager not initialized');
+
+            if (!sessionRegistry) {
+                vscode.window.showErrorMessage('EasyCrypt: Session registry not initialized');
                 logger?.commandComplete('easycrypt.startProcess', false, { error: 'not initialized' });
                 return;
             }
-            try {
-                const activeDocument = vscode.window.activeTextEditor?.document;
-                const sessionContext = activeDocument?.languageId === 'easycrypt'
-                    ? resolveSessionContextForDocument(activeDocument)
-                    : undefined;
 
-                if (processManager.isRunning()) {
-                    if (sessionContext) {
-                        log(`Manual restart with context cwd=${sessionContext.workingDirectory}`);
-                        await processManager.restart(sessionContext);
-                        logger?.commandComplete('easycrypt.startProcess', true, { action: 'restart-with-context' });
-                    } else {
-                        await processManager.restart();
-                        logger?.commandComplete('easycrypt.startProcess', true, { action: 'restart' });
-                    }
-                } else {
-                    if (sessionContext) {
-                        log(`Manual start with context cwd=${sessionContext.workingDirectory}`);
-                        await processManager.start(sessionContext);
-                    } else {
-                        await processManager.start();
-                    }
-                    vscode.window.showInformationMessage('EasyCrypt process started');
-                    logger?.commandComplete('easycrypt.startProcess', true, {
-                        action: sessionContext ? 'start-with-context' : 'start'
-                    });
+            let session = sessionRegistry.getActiveSession();
+            if (!session) {
+                const editor = getActiveEasyCryptEditor();
+                if (editor) {
+                    session = await ensureActiveSessionForEditor(editor);
                 }
+            }
+            if (!session) {
+                session = sessionRegistry.getAllSessions()[0];
+            }
+
+            if (!session) {
+                vscode.window.showWarningMessage('Open an EasyCrypt file first');
+                logger?.commandComplete('easycrypt.startProcess', false, { error: 'no active session' });
+                return;
+            }
+
+            try {
+                if (session.processManager.isRunning()) {
+                    await session.restart();
+                    logger?.commandComplete('easycrypt.startProcess', true, {
+                        action: 'restart',
+                        sessionKey: session.key
+                    });
+                    return;
+                }
+
+                await session.ensureStarted();
+                vscode.window.showInformationMessage('EasyCrypt process started');
+                logger?.commandComplete('easycrypt.startProcess', true, {
+                    action: 'start',
+                    sessionKey: session.key
+                });
             } catch (error) {
                 const msg = error instanceof Error ? error.message : String(error);
                 vscode.window.showErrorMessage(`EasyCrypt: Failed to start process - ${msg}`);
-                logger?.commandComplete('easycrypt.startProcess', false, { error: msg });
+                logger?.commandComplete('easycrypt.startProcess', false, {
+                    error: msg,
+                    sessionKey: session.key
+                });
             }
-        }
+        })
     );
-    context.subscriptions.push(startProcess);
 
-    // Command to stop the EasyCrypt process
-    const stopProcess = vscode.commands.registerCommand(
-        'easycrypt.stopProcess',
-        () => {
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.stopProcess', async () => {
             logger?.command('easycrypt.stopProcess');
-            if (processManager?.isRunning()) {
-                processManager.stop();
-                vscode.window.showInformationMessage('EasyCrypt process stopped');
-                logger?.commandComplete('easycrypt.stopProcess', true);
-            } else {
+
+            const session = sessionRegistry?.getActiveSession() ?? sessionRegistry?.getAllSessions()[0];
+            if (!session) {
                 vscode.window.showInformationMessage('EasyCrypt process is not running');
                 logger?.commandComplete('easycrypt.stopProcess', false, { reason: 'not running' });
-            }
-        }
-    );
-    context.subscriptions.push(stopProcess);
-
-    // Command to step forward
-    const stepForwardCmd = vscode.commands.registerCommand(
-        'easycrypt.stepForward',
-        async () => {
-            logger?.command('easycrypt.stepForward', { 
-                executionOffset: stepManager?.getExecutionOffset() 
-            });
-            if (!stepManager) {
-                vscode.window.showErrorMessage('EasyCrypt: Step manager not initialized');
-                logger?.commandComplete('easycrypt.stepForward', false, { error: 'not initialized' });
                 return;
             }
-            const result = await stepManager.stepForward();
-            logger?.commandComplete('easycrypt.stepForward', result.success, {
-                executionOffset: result.executionOffset,
-                error: result.error
-            });
-            if (!result.success && result.error) {
-                vscode.window.showWarningMessage(`EasyCrypt: ${result.error}`);
+
+            if (!session.processManager.isRunning()) {
+                vscode.window.showInformationMessage('EasyCrypt process is not running');
+                logger?.commandComplete('easycrypt.stopProcess', false, {
+                    reason: 'not running',
+                    sessionKey: session.key
+                });
+                return;
             }
+
+            await session.stop('manual-stop');
+            vscode.window.showInformationMessage('EasyCrypt process stopped');
+            logger?.commandComplete('easycrypt.stopProcess', true, {
+                sessionKey: session.key
+            });
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.stepForward', async () => {
+            return runRoutedStepCommand('stepForward', 'easycrypt.stepForward', async (session) => {
+                await session.ensureStarted();
+                return session.stepManager.stepForward();
+            });
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.stepBackward', async () => {
+            return runRoutedStepCommand('stepBackward', 'easycrypt.stepBackward', async (session) => {
+                await session.ensureStarted();
+                return session.stepManager.stepBackward();
+            });
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.goToCursor', async () => {
+            return runRoutedStepCommand('goToCursor', 'easycrypt.goToCursor', async (session) => {
+                await session.ensureStarted();
+                return session.stepManager.goToCursor();
+            });
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.resetProof', async () => {
+            const result = await runRoutedStepCommand('resetProof', 'easycrypt.resetProof', async (session) => {
+                session.stepManager.reset();
+                if (session.processManager.isRunning()) {
+                    await session.restart();
+                }
+                return { success: true, executionOffset: session.stepManager.getExecutionOffset() };
+            });
+
+            if (result?.success) {
+                vscode.window.showInformationMessage('EasyCrypt: Proof state reset');
+            }
+
             return result;
-        }
+        })
     );
-    context.subscriptions.push(stepForwardCmd);
 
-    // Command to step backward
-    const stepBackwardCmd = vscode.commands.registerCommand(
-        'easycrypt.stepBackward',
-        async () => {
-            logger?.command('easycrypt.stepBackward', { 
-                executionOffset: stepManager?.getExecutionOffset() 
-            });
-            if (!stepManager) {
-                vscode.window.showErrorMessage('EasyCrypt: Step manager not initialized');
-                logger?.commandComplete('easycrypt.stepBackward', false, { error: 'not initialized' });
-                return;
-            }
-            const result = await stepManager.stepBackward();
-            logger?.commandComplete('easycrypt.stepBackward', result.success, {
-                executionOffset: result.executionOffset,
-                error: result.error
-            });
-            if (!result.success && result.error) {
-                vscode.window.showWarningMessage(`EasyCrypt: ${result.error}`);
-            }
-            return result;
-        }
-    );
-    context.subscriptions.push(stepBackwardCmd);
-
-    // Command to go to cursor
-    const goToCursorCmd = vscode.commands.registerCommand(
-        'easycrypt.goToCursor',
-        async () => {
-            const editor = vscode.window.activeTextEditor;
-            const cursorOffset = editor ? editor.document.offsetAt(editor.selection.active) : undefined;
-            logger?.command('easycrypt.goToCursor', { 
-                executionOffset: stepManager?.getExecutionOffset(),
-                cursorOffset
-            });
-            if (!stepManager) {
-                vscode.window.showErrorMessage('EasyCrypt: Step manager not initialized');
-                logger?.commandComplete('easycrypt.goToCursor', false, { error: 'not initialized' });
-                return;
-            }
-            const result = await stepManager.goToCursor();
-            logger?.commandComplete('easycrypt.goToCursor', result.success, {
-                executionOffset: result.executionOffset,
-                error: result.error
-            });
-            if (!result.success && result.error) {
-                vscode.window.showWarningMessage(`EasyCrypt: ${result.error}`);
-            }
-            return result;
-        }
-    );
-    context.subscriptions.push(goToCursorCmd);
-
-    // Command to reset proof state
-    const resetProofCmd = vscode.commands.registerCommand(
-        'easycrypt.resetProof',
-        async () => {
-            logger?.command('easycrypt.resetProof');
-            if (!stepManager || !processManager) {
-                vscode.window.showErrorMessage('EasyCrypt: Extension not initialized');
-                logger?.commandComplete('easycrypt.resetProof', false, { error: 'not initialized' });
-                return;
-            }
-            stepManager.reset();
-            if (processManager.isRunning()) {
-                await processManager.restart();
-            }
-            vscode.window.showInformationMessage('EasyCrypt: Proof state reset');
-            logger?.commandComplete('easycrypt.resetProof', true);
-            return { success: true };
-        }
-    );
-    context.subscriptions.push(resetProofCmd);
-
-    // Command to toggle verbose logging
-    const toggleVerboseLoggingCmd = vscode.commands.registerCommand(
-        'easycrypt.toggleVerboseLogging',
-        async () => {
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.toggleVerboseLogging', async () => {
             const config = vscode.workspace.getConfiguration('easycrypt');
             const currentValue = config.get<boolean>('verboseLogging', false);
             const newValue = !currentValue;
-            
+
             await config.update('verboseLogging', newValue, vscode.ConfigurationTarget.Global);
-            
-            const message = newValue 
+
+            const message = newValue
                 ? 'EasyCrypt: Verbose logging enabled. Check the Output panel (EasyCrypt channel).'
                 : 'EasyCrypt: Verbose logging disabled.';
             vscode.window.showInformationMessage(message);
-            
+
             if (newValue) {
-                // Show the output channel when enabling verbose logging
                 outputChannel?.show(true);
             }
-        }
+        })
     );
-    context.subscriptions.push(toggleVerboseLoggingCmd);
 
-    // Internal/testing command: query current execution offset.
-    // Not contributed to the command palette, but useful for E2E tests.
-    const getExecutionOffsetCmd = vscode.commands.registerCommand('easycrypt._getExecutionOffset', () => {
-        return stepManager?.getExecutionOffset() ?? 0;
-    });
-    context.subscriptions.push(getExecutionOffsetCmd);
-
-    // Internal/testing command: query current verified range decoration.
-    // Returns a plain object so tests don't depend on VS Code class serialization.
-    const getVerifiedRangeCmd = vscode.commands.registerCommand('easycrypt._getVerifiedRange', () => {
-        const range = editorDecorator?.getVerifiedRange();
-        if (!range) {
-            return null;
-        }
-        return {
-            start: { line: range.start.line, character: range.start.character },
-            end: { line: range.end.line, character: range.end.character }
-        };
-    });
-    context.subscriptions.push(getVerifiedRangeCmd);
-
-    // Internal/testing command: query how many times the EasyCrypt process has started.
-    // Useful for performance regressions (e.g., ensuring a backward jump triggers only one recovery).
-    const getProcessStartCountCmd = vscode.commands.registerCommand('easycrypt._getProcessStartCount', () => {
-        return processManager?.getProcessStartCount() ?? 0;
-    });
-    context.subscriptions.push(getProcessStartCountCmd);
-
-    // Internal/testing command: query how many times sendCommand() was invoked.
-    // Useful to assert one-shot batching (single send for multi-statement replay).
-    const getSendCommandCountCmd = vscode.commands.registerCommand('easycrypt._getSendCommandCount', () => {
-        return processManager?.getSendCommandCount() ?? 0;
-    });
-    context.subscriptions.push(getSendCommandCountCmd);
-
-    // Internal/testing command: query number of proof state changes since last reset.
-    const getProofStateChangeCountCmd = vscode.commands.registerCommand('easycrypt._getProofStateChangeCount', () => {
-        return proofStateChangeCount;
-    });
-    context.subscriptions.push(getProofStateChangeCountCmd);
-
-    // Internal/testing command: reset proof state change counter.
-    const resetProofStateChangeCountCmd = vscode.commands.registerCommand('easycrypt._resetProofStateChangeCount', () => {
-        proofStateChangeCount = 0;
-        return true;
-    });
-    context.subscriptions.push(resetProofStateChangeCountCmd);
-
-    // Internal/testing command: query how many updateState messages were posted to the Proof State webview.
-    const getProofStateViewUpdateCountCmd = vscode.commands.registerCommand('easycrypt._getProofStateViewUpdateCount', () => {
-        return proofStateViewProvider?.getPostedUpdateCount() ?? 0;
-    });
-    context.subscriptions.push(getProofStateViewUpdateCountCmd);
-
-    // Internal/testing command: reset Proof State webview update counter.
-    const resetProofStateViewUpdateCountCmd = vscode.commands.registerCommand('easycrypt._resetProofStateViewUpdateCount', () => {
-        proofStateViewProvider?.resetPostedUpdateCount();
-        return true;
-    });
-    context.subscriptions.push(resetProofStateViewUpdateCountCmd);
-
-    // Internal/testing command: simulate a message from the webview.
-    const simulateWebviewMessageCmd = vscode.commands.registerCommand('easycrypt._simulateWebviewMessage', (message: any) => {
-        proofStateViewProvider?.simulateMessage(message);
-        return true;
-    });
-    context.subscriptions.push(simulateWebviewMessageCmd);
-
-    // Internal/testing command: get a snapshot of the current proof state.
-    // Returns a plain object for deterministic test assertions against proof state content.
-    // This allows tests to verify the correct "last output" is shown without depending on webview.
-    // Includes provedStatementCount and debugEmacsPromptMarker for prompt/statement sync assertions.
-    const getProofStateSnapshotCmd = vscode.commands.registerCommand('easycrypt._getProofStateSnapshot', () => {
-        if (!proofStateManager) {
-            return null;
-        }
-        const state = proofStateManager.state;
-        return {
-            isProcessing: state.isProcessing,
-            isComplete: state.isComplete,
-            outputLines: state.outputLines ?? [],
-            messages: state.messages.map(m => ({
-                severity: m.severity,
-                content: m.content
-            })),
-            goalsCount: state.goals.length,
-            rawOutputLength: state.rawOutput?.length ?? 0,
-            // Progress and debug fields for prompt/statement sync assertions
-            provedStatementCount: state.progress?.provedStatementCount,
-            debugEmacsPromptMarker: state.debugEmacsPromptMarker
-        };
-    });
-    context.subscriptions.push(getProofStateSnapshotCmd);
-
-    // Command to force recovery of proof state
-    // Useful when the user suspects the session is desynchronized
-    const forceRecoveryCmd = vscode.commands.registerCommand(
-        'easycrypt.forceRecovery',
-        async () => {
-            logger?.command('easycrypt.forceRecovery', {
-                executionOffset: stepManager?.getExecutionOffset()
-            });
-            if (!stepManager) {
-                vscode.window.showErrorMessage('EasyCrypt: Step manager not initialized');
-                logger?.commandComplete('easycrypt.forceRecovery', false, { error: 'not initialized' });
-                return;
-            }
-            
-            const result = await stepManager.forceRecovery();
-            logger?.commandComplete('easycrypt.forceRecovery', result.success, {
-                executionOffset: result.executionOffset,
-                error: result.error
-            });
-            if (result.success) {
-                vscode.window.showInformationMessage('EasyCrypt: Proof state recovered successfully');
-            } else {
-                vscode.window.showWarningMessage(`EasyCrypt: Recovery failed - ${result.error}`);
-            }
-            return result;
-        }
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._getExecutionOffset', () => {
+            return sessionRegistry?.getActiveSession()?.stepManager.getExecutionOffset() ?? 0;
+        })
     );
-    context.subscriptions.push(forceRecoveryCmd);
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._getVerifiedRange', () => {
+            const editor = getActiveEasyCryptEditor();
+            if (!editor || !decorationProjectionService) {
+                return null;
+            }
+
+            const range = decorationProjectionService.getVerifiedRange(editor.document.uri);
+            if (!range) {
+                return null;
+            }
+
+            return {
+                start: { line: range.start.line, character: range.start.character },
+                end: { line: range.end.line, character: range.end.character }
+            };
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._getProcessStartCount', () => {
+            return sessionRegistry?.getActiveSession()?.processManager.getProcessStartCount() ?? 0;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._getSendCommandCount', () => {
+            return sessionRegistry?.getActiveSession()?.processManager.getSendCommandCount() ?? 0;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._getProofStateChangeCount', () => {
+            return proofStateChangeCount;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._resetProofStateChangeCount', () => {
+            proofStateChangeCount = 0;
+            return true;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._getProofStateViewUpdateCount', () => {
+            return proofStateViewProvider?.getPostedUpdateCount() ?? 0;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._resetProofStateViewUpdateCount', () => {
+            proofStateViewProvider?.resetPostedUpdateCount();
+            return true;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._simulateWebviewMessage', (message: any) => {
+            proofStateViewProvider?.simulateMessage(message);
+            return true;
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt._getProofStateSnapshot', () => {
+            const state = sessionRegistry?.getActiveSession()?.proofStateManager.state;
+            if (!state) {
+                return null;
+            }
+
+            return {
+                isProcessing: state.isProcessing,
+                isComplete: state.isComplete,
+                outputLines: state.outputLines ?? [],
+                messages: state.messages.map((message) => ({
+                    severity: message.severity,
+                    content: message.content
+                })),
+                goalsCount: state.goals.length,
+                rawOutputLength: state.rawOutput?.length ?? 0,
+                provedStatementCount: state.progress?.provedStatementCount,
+                debugEmacsPromptMarker: state.debugEmacsPromptMarker
+            };
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('easycrypt.forceRecovery', async () => {
+            return runRoutedStepCommand('forceRecovery', 'easycrypt.forceRecovery', async (session) => {
+                await session.ensureStarted();
+                const result = await session.stepManager.forceRecovery();
+                if (result.success) {
+                    vscode.window.showInformationMessage('EasyCrypt: Proof state recovered successfully');
+                } else {
+                    vscode.window.showWarningMessage(`EasyCrypt: Recovery failed - ${result.error}`);
+                }
+                return result;
+            });
+        })
+    );
 }
 
 /**
@@ -634,7 +657,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
  * @param document - The document to check
  */
 async function checkDocument(document: vscode.TextDocument): Promise<void> {
-    if (!processManager || !outputChannel) {
+    if (!outputChannel) {
         vscode.window.showErrorMessage('EasyCrypt: Extension not fully initialized');
         return;
     }
@@ -860,95 +883,101 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
     });
     context.subscriptions.push(checkCompleteHandler);
 
-    // Initialize process manager
-    processManager = new ProcessManager(configurationManager, outputChannel);
-    context.subscriptions.push(processManager);
-
-    // Log process events
-    context.subscriptions.push(
-        processManager.onDidStart(() => {
-            logger?.event('onDidStart', { component: 'ProcessManager' });
-        })
-    );
-    context.subscriptions.push(
-        processManager.onDidStop(({ code, signal }) => {
-            logger?.event('onDidStop', { component: 'ProcessManager', code, signal });
-        })
-    );
-    context.subscriptions.push(
-        processManager.onError((error) => {
-            logger?.event('onError', { component: 'ProcessManager', error: error.message });
-        })
-    );
-
-    // Initialize proof state manager
-    proofStateManager = new ProofStateManager();
-    context.subscriptions.push(proofStateManager);
-
-    // Track proof state changes (used by deterministic E2E tests)
-    context.subscriptions.push(
-        proofStateManager.onDidChangeState((event) => {
-            proofStateChangeCount += 1;
-            logger?.proof('onDidChangeState', {
-                isProcessing: event.state.isProcessing,
-                isComplete: event.state.isComplete,
-                goalsCount: event.state.goals.length,
-                messagesCount: event.state.messages.length,
-                outputLinesCount: event.state.outputLines?.length ?? 0
-            });
-        })
-    );
-
-    // Wire up process output to diagnostics and proof state
-    // Note: StepManager handles proofStateManager updates when stepping
-    const outputHandler = processManager.onOutput((output) => {
-        logger?.process('onOutput', {
-            rawLength: output.raw?.length ?? 0,
-            errorCount: output.parsed.errors.length,
-            fileUri: output.fileUri?.fsPath
-        });
-
-        // Only update proof state if:
-        // 1. Not stepping (StepManager handles it during steps)
-        // 2. Not recovering (StepManager handles it during recovery)
-        // 3. No active transaction (multi-statement operations use transactions)
-        // 4. Not within the grace period after a transaction finalized (late-chunk safety)
-        // This prevents late output chunks from spamming the Proof State view.
-        const hasActiveTransaction = proofStateManager?.getActiveTransaction() !== undefined;
-        const isWithinGrace = proofStateManager?.isWithinGracePeriod() ?? false;
-        if (!stepManager?.isStepping() && !stepManager?.isRecovering() && !hasActiveTransaction && !isWithinGrace) {
-            proofStateManager?.handleProcessOutput(output);
-        }
-
-        if (!output.fileUri) {
-            return;
-        }
-
-        // Keep diagnostics in sync with process output.
-        diagnosticManager?.setDiagnostics(output.fileUri, output.parsed.errors);
-        if (output.parsed.errors.length > 0) {
-            log(`ProcessManager reported ${output.parsed.errors.length} error(s)`);
-        }
-    });
-    context.subscriptions.push(outputHandler);
-
-    // Initialize editor decorator
+    // Initialize decoration renderer and projection service
     editorDecorator = new EditorDecorator();
     context.subscriptions.push(editorDecorator);
 
-    // Initialize step manager
-    stepManager = new StepManager(
-        processManager,
-        proofStateManager,
-        editorDecorator,
-        configurationManager,
-        outputChannel
-    );
-    context.subscriptions.push(stepManager);
+    decorationProjectionService = new DecorationProjectionService(editorDecorator);
+    context.subscriptions.push(decorationProjectionService);
 
-    // Initialize proof state view provider
-    proofStateViewProvider = new ProofStateViewProvider(context.extensionUri, proofStateManager);
+    sessionRegistry = new SessionRegistry<vscode.TextDocument, EasyCryptFileSession>({
+        createSession: (document, key) => {
+            if (!configurationManager || !diagnosticManager || !decorationProjectionService || !outputChannel) {
+                throw new Error('EasyCrypt: Session dependencies are not initialized');
+            }
+
+            return new EasyCryptFileSession({
+                key,
+                documentUri: document.uri,
+                configurationManager,
+                diagnosticManager,
+                decorationProjection: decorationProjectionService,
+                outputChannel,
+                logger
+            });
+        },
+        managedLanguageId: 'easycrypt',
+        log: (level, message, data) => {
+            switch (level) {
+                case 'debug':
+                    logger?.debug('SessionRegistry', message, data);
+                    break;
+                case 'info':
+                    logger?.info('SessionRegistry', message, data);
+                    break;
+                case 'warn':
+                    logger?.warn('SessionRegistry', message, data);
+                    break;
+            }
+        }
+    });
+    context.subscriptions.push(sessionRegistry);
+
+    sessionCommandRouter = new SessionCommandRouter<EasyCryptFileSession>(
+        () => sessionRegistry?.getActiveSession(),
+        (level, message, data) => {
+            switch (level) {
+                case 'debug':
+                    logger?.debug('SessionCommandRouter', message, data);
+                    break;
+                case 'info':
+                    logger?.info('SessionCommandRouter', message, data);
+                    break;
+                case 'warn':
+                    logger?.warn('SessionCommandRouter', message, data);
+                    break;
+            }
+        }
+    );
+    context.subscriptions.push(sessionCommandRouter);
+
+    context.subscriptions.push(
+        sessionRegistry.onDidCreateSession((session) => {
+            const disposable = session.proofStateManager.onDidChangeState((event) => {
+                proofStateChangeCount += 1;
+                logger?.proof('onDidChangeState', {
+                    sessionKey: session.key,
+                    isProcessing: event.state.isProcessing,
+                    isComplete: event.state.isComplete,
+                    goalsCount: event.state.goals.length,
+                    messagesCount: event.state.messages.length,
+                    outputLinesCount: event.state.outputLines?.length ?? 0
+                });
+            });
+
+            proofStateSubscriptionBySessionKey.set(session.key, disposable);
+        })
+    );
+
+    context.subscriptions.push(
+        sessionRegistry.onDidDisposeSession(({ key }) => {
+            proofStateSubscriptionBySessionKey.get(key)?.dispose();
+            proofStateSubscriptionBySessionKey.delete(key);
+        })
+    );
+
+    context.subscriptions.push(
+        sessionRegistry.onDidChangeActiveSession((session) => {
+            decorationProjectionService?.projectVisibleEditors(session?.documentUri);
+        })
+    );
+
+    // Initialize proof state view provider + active-session bridge
+    proofStateViewProvider = new ProofStateViewProvider(context.extensionUri);
     context.subscriptions.push(proofStateViewProvider);
+
+    activeProofStateBridge = new ActiveProofStateBridge(sessionRegistry, proofStateViewProvider, logger);
+    context.subscriptions.push(activeProofStateBridge);
 
     // Register the webview view provider
     const viewProviderRegistration = vscode.window.registerWebviewViewProvider(
@@ -970,40 +999,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
     // Register configuration handlers
     registerConfigurationHandlers(context);
 
-    // Auto-start the EasyCrypt REPL when an EasyCrypt editor becomes active.
-    // This is best-effort and avoids popping configuration UI on failure.
+    // Keep active session/projection in sync with editor focus.
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(async (editor) => {
-            if (!editor || editor.document.languageId !== 'easycrypt') {
+            if (!sessionRegistry) {
                 return;
             }
 
-            if (!processManager || !configurationManager) {
-                return;
-            }
-
-            const sessionContext = resolveSessionContextForDocument(editor.document);
-            if (!sessionContext) {
-                log('Auto-start skipped: unable to resolve session context for active document');
-                return;
-            }
-
-            try {
-                if (!processManager.isRunning()) {
-                    const validation = await configurationManager.validateExecutablePath();
-                    if (!validation.valid) {
-                        log(`Auto-start skipped: ${validation.error ?? 'invalid executable path'}`);
-                        return;
-                    }
-                }
-
-                await processManager.ensureSessionContext(sessionContext);
-            } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                log(`Auto-start failed: ${msg}`);
-            }
+            await sessionRegistry.setActiveDocument(editor?.document);
+            decorationProjectionService?.projectVisibleEditors(editor?.document.uri);
         })
     );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidCloseTextDocument((document) => {
+            if (document.languageId !== 'easycrypt') {
+                return;
+            }
+
+            void sessionRegistry?.disposeSessionByUri(document.uri, 'file-close');
+            decorationProjectionService?.clear(document.uri);
+        })
+    );
+
+    await sessionRegistry.setActiveDocument(vscode.window.activeTextEditor?.document);
+    decorationProjectionService.projectVisibleEditors(vscode.window.activeTextEditor?.document.uri);
 
     log('EasyCrypt extension activated successfully');
     
@@ -1048,34 +1068,37 @@ async function validateExecutableOnStartup(): Promise<void> {
  * This function is called when the extension is deactivated.
  * Clean up any resources here.
  */
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
     log('EasyCrypt extension deactivating...');
     logger?.info('Extension', 'Deactivating EasyCrypt extension');
-    
-    // Stop process manager
-    if (processManager) {
-        processManager.stop();
-        processManager = undefined;
+
+    if (sessionRegistry) {
+        await sessionRegistry.disposeAll('shutdown');
+        sessionRegistry = undefined;
     }
+
+    proofStateSubscriptionBySessionKey.forEach((disposable) => disposable.dispose());
+    proofStateSubscriptionBySessionKey.clear();
+
+    sessionCommandRouter = undefined;
+    activeProofStateBridge = undefined;
+    decorationProjectionService = undefined;
     
     // Dispose configuration manager singleton
     disposeConfigurationManager();
-    
-    // Clean up proof state components
-    stepManager = undefined;
+
     editorDecorator = undefined;
-    proofStateManager = undefined;
     proofStateViewProvider = undefined;
-    
+
     // DiagnosticManager and ConfigurationManager are disposed via context.subscriptions
     configurationManager = undefined;
     diagnosticManager = undefined;
     statusBarItem = undefined;
-    
+
     // Dispose logger
     Logger.disposeInstance();
     logger = undefined;
-    
+
     outputChannel = undefined;
 }
 
