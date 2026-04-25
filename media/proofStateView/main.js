@@ -71,6 +71,14 @@
         debugEmacsPromptMarker: undefined
     };
 
+    const MIN_LAYOUT_SCALE = 0.4;
+    const SCALE_EPSILON = 0.01;
+
+    /** @type {number|undefined} */
+    let pendingFitFrame;
+    /** @type {HTMLElement|null} */
+    let lastFitTarget = null;
+
     /**
      * Creates a text node safely (no HTML interpretation)
      * @param {string} text
@@ -96,6 +104,70 @@
             el.textContent = textContent;
         }
         return el;
+    }
+
+    /**
+     * @param {number} value
+     * @param {number} min
+     * @param {number} max
+     * @returns {number}
+     */
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    /**
+     * Scales state content to fit the available viewport height.
+     * Keeps the view static (no internal scrollbars) while stepping.
+     * @param {HTMLElement|null} target
+     */
+    function applyLayoutFit(target) {
+        if (!target) {
+            return;
+        }
+
+        const viewport = target.parentElement;
+        if (!viewport) {
+            return;
+        }
+
+        target.style.setProperty('--proof-fit-scale', '1');
+        target.classList.remove('is-scaled');
+
+        const availableHeight = viewport.clientHeight;
+        const naturalHeight = target.scrollHeight;
+
+        if (availableHeight <= 0 || naturalHeight <= 0) {
+            return;
+        }
+
+        const nextScale = naturalHeight > availableHeight
+            ? clamp(availableHeight / naturalHeight, MIN_LAYOUT_SCALE, 1)
+            : 1;
+
+        target.style.setProperty('--proof-fit-scale', String(nextScale));
+        target.classList.toggle('is-scaled', nextScale < 1 - SCALE_EPSILON);
+    }
+
+    /**
+     * Defers fit calculation until after layout settles.
+     * @param {HTMLElement|null} target
+     */
+    function scheduleLayoutFit(target) {
+        if (!target) {
+            return;
+        }
+
+        lastFitTarget = target;
+
+        if (pendingFitFrame !== undefined) {
+            cancelAnimationFrame(pendingFitFrame);
+        }
+
+        pendingFitFrame = requestAnimationFrame(() => {
+            pendingFitFrame = undefined;
+            applyLayoutFit(lastFitTarget);
+        });
     }
 
     /**
@@ -317,29 +389,37 @@
         // Always render toolbar at the top
         app.appendChild(renderToolbar());
 
+        const viewport = createElement('div', 'state-viewport');
+        app.appendChild(viewport);
+
         // Processing state
         if (state.isProcessing) {
-            app.appendChild(renderProcessing());
+            viewport.appendChild(renderProcessing());
             return;
         }
+
+        const layout = createElement('div', 'state-layout');
 
         // Progress header (proved count, last statement, optional prompt marker)
         const progressHeader = renderProgressHeader();
         if (progressHeader) {
-            app.appendChild(progressHeader);
+            layout.appendChild(progressHeader);
         }
 
         // Output section (lossless last statement output)
         const outputSection = renderOutputSection();
         if (outputSection) {
-            app.appendChild(outputSection);
+            layout.appendChild(outputSection);
         }
 
         // Messages section
         const messagesSection = renderMessagesSection();
         if (messagesSection) {
-            app.appendChild(messagesSection);
+            layout.appendChild(messagesSection);
         }
+
+        viewport.appendChild(layout);
+        scheduleLayoutFit(layout);
     }
 
     /**
@@ -356,6 +436,11 @@
 
     // Listen for messages from the extension
     window.addEventListener('message', handleMessage);
+
+    // Re-fit when the view is resized by the workbench layout
+    window.addEventListener('resize', () => {
+        scheduleLayoutFit(lastFitTarget);
+    });
 
     // Initial render
     render();

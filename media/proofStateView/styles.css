@@ -7,6 +7,7 @@
 :root {
     --container-padding: 12px;
     --border-radius: 4px;
+    --proof-fit-scale: 1;
 }
 
 * {
@@ -15,13 +16,47 @@
     padding: 0;
 }
 
+html,
+body {
+    height: 100%;
+    overflow: hidden;
+}
+
 body {
     font-family: var(--vscode-font-family);
     font-size: var(--vscode-font-size);
     color: var(--vscode-foreground);
     background-color: var(--vscode-sideBar-background);
-    padding: var(--container-padding);
+    padding: 0;
     line-height: 1.4;
+}
+
+#app {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: var(--container-padding);
+}
+
+.state-viewport {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.state-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: calc(100% / var(--proof-fit-scale));
+    transform: scale(var(--proof-fit-scale));
+    transform-origin: top left;
+}
+
+.state-layout.is-scaled {
+    line-height: 1.3;
 }
 
 /* Navigation Toolbar */
@@ -30,7 +65,6 @@ body {
     flex-wrap: wrap;
     gap: 4px;
     padding: 6px 0;
-    margin-bottom: 8px;
     border-bottom: 1px solid var(--vscode-panel-border);
 }
 
@@ -72,16 +106,16 @@ body {
 }
 
 .section {
-    margin-bottom: 16px;
+    margin-bottom: 0;
 }
 
 .section-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 0;
+    padding: 6px 0;
     border-bottom: 1px solid var(--vscode-panel-border);
-    margin-bottom: 8px;
+    margin-bottom: 6px;
 }
 
 .section-title {
@@ -175,8 +209,7 @@ body {
 }
 
 .messages-container {
-    max-height: 200px;
-    overflow-y: auto;
+    overflow: hidden;
 }
 
 .message {
@@ -229,7 +262,8 @@ body {
     align-items: center;
     justify-content: center;
     gap: 8px;
-    padding: 16px;
+    height: 100%;
+    min-height: 0;
     color: var(--vscode-descriptionForeground);
 }
 
@@ -256,13 +290,12 @@ body {
     background-color: var(--vscode-editor-background);
     border: 1px solid var(--vscode-panel-border);
     border-radius: var(--border-radius);
-    max-height: 300px;
-    overflow-y: auto;
+    overflow: hidden;
 }
 
 /* Progress Header Styles */
 .progress-header {
-    margin-bottom: 12px;
+    margin-bottom: 0;
     padding: 8px 10px;
     background-color: var(--vscode-sideBarSectionHeader-background);
     border: 1px solid var(--vscode-panel-border);
