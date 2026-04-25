@@ -102,7 +102,12 @@ Logging / debug:
 
 ## Development
 
-Prereqs: Node.js + npm.
+Prereqs: Node.js 24 + npm.
+
+If you use nvm:
+
+- `nvm install`
+- `nvm use`
 
 - Install dependencies: `npm install`
 - Compile: `npm run compile`
