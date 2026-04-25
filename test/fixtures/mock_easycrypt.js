@@ -12,9 +12,123 @@
 
 const readline = require('readline');
 const fs = require('fs');
+const path = require('path');
 
 const args = process.argv.slice(2);
 const command = args[0];
+
+function normalizePathForComparison(value) {
+    const resolved = path.normalize(path.resolve(value));
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function uniquePaths(values) {
+    const seen = new Set();
+    const deduped = [];
+
+    for (const value of values) {
+        const key = normalizePathForComparison(value);
+        if (seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        deduped.push(path.normalize(path.resolve(value)));
+    }
+
+    return deduped;
+}
+
+function resolvePathMaybeRelative(value, cwd) {
+    if (path.isAbsolute(value)) {
+        return path.normalize(value);
+    }
+
+    return path.normalize(path.resolve(cwd, value));
+}
+
+function parseIncludeRoots(rawArgs, cwd) {
+    const includeRoots = [];
+
+    for (let index = 0; index < rawArgs.length; index++) {
+        const arg = rawArgs[index];
+
+        if (arg === '-I' && index + 1 < rawArgs.length) {
+            includeRoots.push(resolvePathMaybeRelative(rawArgs[index + 1], cwd));
+            index += 1;
+            continue;
+        }
+
+        if (arg.startsWith('-I') && arg.length > 2) {
+            includeRoots.push(resolvePathMaybeRelative(arg.slice(2), cwd));
+        }
+    }
+
+    return uniquePaths(includeRoots);
+}
+
+function stripInlineComments(line) {
+    return line.replace(/\(\*.*?\*\)/g, ' ');
+}
+
+function extractImportedModules(line) {
+    const sanitized = stripInlineComments(line).trim();
+    if (!/^require\b/.test(sanitized)) {
+        return [];
+    }
+
+    let body = sanitized.replace(/^require\b/, '').trim();
+    if (body.startsWith('import ')) {
+        body = body.slice('import '.length).trim();
+    }
+
+    if (body.endsWith('.')) {
+        body = body.slice(0, -1).trim();
+    }
+
+    if (!body) {
+        return [];
+    }
+
+    return body
+        .split(/\s+/)
+        .map((token) => token.replace(/[.;]/g, '').trim())
+        .filter((token) => /^[A-Za-z_][A-Za-z0-9_']*$/.test(token));
+}
+
+function shouldValidateImport(moduleName) {
+    if (process.env.MOCK_EC_CHECK_ALL_IMPORTS === '1') {
+        return true;
+    }
+
+    // Default heuristic: local project modules in this repo use underscores.
+    return moduleName.includes('_');
+}
+
+function moduleExistsInRoots(moduleName, roots) {
+    for (const root of roots) {
+        const ecPath = path.join(root, `${moduleName}.ec`);
+        const ecaPath = path.join(root, `${moduleName}.eca`);
+        if (fs.existsSync(ecPath) || fs.existsSync(ecaPath)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function findMissingImports(line, roots) {
+    const modules = extractImportedModules(line).filter(shouldValidateImport);
+    const missingModules = [];
+
+    for (const moduleName of modules) {
+        if (!moduleExistsInRoots(moduleName, roots)) {
+            missingModules.push(moduleName);
+        }
+    }
+
+    return missingModules;
+}
 
 function emitError(line, startCol, endCol, message) {
     console.log(`[critical] [mock.ec: line ${line} (${startCol}-${endCol})] ${message}`);
@@ -34,6 +148,10 @@ if (looksLikeFlag(command)) {
 
 } else if (command === 'cli') {
     // Interactive REPL mode
+    const strictImportResolution = process.env.MOCK_EC_STRICT_IMPORTS === '1';
+    const includeRoots = parseIncludeRoots(args.slice(1), process.cwd());
+    const searchRoots = uniquePaths([process.cwd(), ...includeRoots]);
+
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
@@ -117,6 +235,20 @@ if (looksLikeFlag(command)) {
                 // Skip empty lines and comments
                 lineNumber++;
                 return;
+            }
+
+            if (strictImportResolution) {
+                const missingImports = findMissingImports(trimmed, searchRoots);
+                if (missingImports.length > 0) {
+                    maybeFlushCoalescedPrompt();
+                    for (const missingImport of missingImports) {
+                        writeLine(`[error-${lineNumber}-1]module not found: ${missingImport} (directory/include-path mismatch)`);
+                    }
+                    await emitPromptPossiblyCoalesced();
+                    firstProcessedStatement = false;
+                    lineNumber++;
+                    return;
+                }
             }
 
             // Emit a leading prompt to simulate coalesced stdout (tests prompt counting).
@@ -241,6 +373,9 @@ if (looksLikeFlag(command)) {
     // One-shot compile mode
     const useScript = args.includes('-script');
     const filePath = args.find(a => a.endsWith('.ec') || a.endsWith('.eca')) || args[args.length - 1];
+    const strictImportResolution = process.env.MOCK_EC_STRICT_IMPORTS === '1';
+    const includeRoots = parseIncludeRoots(args.slice(1), process.cwd());
+    const searchRoots = uniquePaths([process.cwd(), ...includeRoots]);
 
     if (!filePath || !fs.existsSync(filePath)) {
         console.error(`Error: File not found: ${filePath}`);
@@ -254,6 +389,22 @@ if (looksLikeFlag(command)) {
     lines.forEach((line, index) => {
         const lineNum = index + 1;
         const trimmed = line.trim();
+
+        if (strictImportResolution) {
+            const missingImports = findMissingImports(trimmed, searchRoots);
+            if (missingImports.length > 0) {
+                hasErrors = true;
+                for (const missingImport of missingImports) {
+                    const message = `module not found: ${missingImport} (directory/include-path mismatch)`;
+                    const endCol = Math.max(2, missingImport.length + 1);
+                    if (useScript) {
+                        console.log(`E critical ${filePath}: line ${lineNum} (1-${endCol}) ${message}`);
+                    } else {
+                        console.log(`[critical] [${filePath}: line ${lineNum} (1-${endCol})] ${message}`);
+                    }
+                }
+            }
+        }
 
         if (trimmed.includes('undefined_symbol') || trimmed.includes('this_is_not_a_tactic')) {
             hasErrors = true;

@@ -16,12 +16,18 @@ import * as vscode from 'vscode';
 import { ProcessManager, ProcessOutput } from './processManager';
 import { ProofStateManager, ProofProgressSnapshot } from './proofStateManager';
 import { EditorDecorator } from './editorDecorator';
+import { ConfigurationManager } from './configurationManager';
 import { findNextStatement, findPreviousStatementEnd, Statement } from './statementParser';
 import { StatementIndex } from './statementIndex';
 import { parseOutput } from './outputParser';
 import { EmacsPromptCounter } from './emacsPromptCounter';
 import { Logger } from './logger';
 import { UndoStateTracker, extractAllPrompts, PromptInfo } from './undoStateTracker';
+import {
+    SessionContextFingerprint,
+    fingerprintVerificationContext,
+    resolveVerificationContext
+} from './verificationContextResolver';
 
 /**
  * Result of a step operation
@@ -126,6 +132,7 @@ export class StepManager implements vscode.Disposable {
         private readonly processManager: ProcessManager,
         private readonly proofStateManager: ProofStateManager,
         private readonly decorator: EditorDecorator,
+        private readonly configManager: ConfigurationManager,
         outputChannel?: vscode.OutputChannel
     ) {
         this.outputChannel = outputChannel;
@@ -302,6 +309,13 @@ export class StepManager implements vscode.Disposable {
             return { success: true, executionOffset: 0 };
         }
 
+        try {
+            await this.ensureSessionContextForDocument(editor.document);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { success: false, error: `Failed to bind session context: ${msg}` };
+        }
+
         return await this.recoverState(currentOffset, editor);
     }
 
@@ -375,6 +389,40 @@ export class StepManager implements vscode.Disposable {
         }
     }
 
+    private getWorkspaceFolderPath(document: vscode.TextDocument): string | undefined {
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+        if (workspaceFolder) {
+            return workspaceFolder.uri.fsPath;
+        }
+
+        return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    }
+
+    private buildSessionContextForDocument(document: vscode.TextDocument): SessionContextFingerprint {
+        const context = resolveVerificationContext({
+            documentPath: document.uri.fsPath,
+            workspaceFolderPath: this.getWorkspaceFolderPath(document),
+            configArgs: this.configManager.getArguments(),
+            proverArgs: this.configManager.getProverArgs()
+        });
+
+        return fingerprintVerificationContext(context);
+    }
+
+    private async ensureSessionContextForDocument(document: vscode.TextDocument): Promise<void> {
+        const sessionContext = this.buildSessionContextForDocument(document);
+        this.log(
+            `Ensuring session context: cwd=${sessionContext.workingDirectory}, ` +
+            `includeRoots=${sessionContext.includeRoots.join(', ') || '<none>'}`
+        );
+        const startsBefore = this.processManager.getProcessStartCount();
+        await this.processManager.ensureSessionContext(sessionContext);
+        const startsAfter = this.processManager.getProcessStartCount();
+        if (startsAfter > startsBefore) {
+            this.undoStateTracker.initialize(0);
+        }
+    }
+
     /**
      * Steps forward by one statement
      * 
@@ -391,6 +439,14 @@ export class StepManager implements vscode.Disposable {
         }
         
         this.setDocument(editor.document);
+
+        try {
+            await this.ensureSessionContextForDocument(editor.document);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { success: false, error: `Failed to bind session context: ${msg}` };
+        }
+
         const text = editor.document.getText();
         
         // Update statement index and find next statement
@@ -407,18 +463,6 @@ export class StepManager implements vscode.Disposable {
         const statementIndex = statementsBeforeThis.length;
         
         this.log(`Stepping forward: "${statement.text.substring(0, 50)}..." (statementIndex=${statementIndex})`);
-        
-        // Ensure process is running
-        if (!this.processManager.isRunning()) {
-            try {
-                await this.processManager.start();
-                // Initialize undo tracker when process starts
-                this.undoStateTracker.initialize(0);
-            } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                return { success: false, error: `Failed to start process: ${msg}` };
-            }
-        }
         
         this.stepping = true;
         this._onDidStartStep.fire();
@@ -524,12 +568,20 @@ export class StepManager implements vscode.Disposable {
         if (this.stepping || (!internal && this.retracting)) {
             return { success: false, error: 'Step already in progress' };
         }
+
+        this.setDocument(editor.document);
+
+        try {
+            await this.ensureSessionContextForDocument(editor.document);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { success: false, error: `Failed to bind session context: ${msg}` };
+        }
         
         if (this.executionOffset === 0) {
             return { success: false, error: 'Already at start' };
         }
-        
-        this.setDocument(editor.document);
+
         const text = editor.document.getText();
         
         // Find previous statement end
@@ -736,7 +788,7 @@ export class StepManager implements vscode.Disposable {
             // Step 1: Reset the EasyCrypt session.
             // In some EasyCrypt versions, `reset.` is not a supported REPL command in cli/emacs mode
             // (it returns a parse error). The most reliable reset is a full process restart.
-            await this.restartProcessForRecovery();
+            await this.restartProcessForRecovery(editor.document);
 
             // Step 2: Reset internal state (but don't update decorations yet - UI suppression)
             this.executionOffset = 0;
@@ -859,9 +911,10 @@ export class StepManager implements vscode.Disposable {
         }
     }
 
-    private async restartProcessForRecovery(): Promise<void> {
+    private async restartProcessForRecovery(document: vscode.TextDocument): Promise<void> {
+        const sessionContext = this.buildSessionContextForDocument(document);
         await this.processManager.stopAndWait(4000);
-        await this.processManager.start();
+        await this.processManager.start(sessionContext);
         // Reset undo state tracker after process restart
         this.undoStateTracker.initialize(0);
     }
@@ -974,6 +1027,14 @@ export class StepManager implements vscode.Disposable {
         }
         
         this.setDocument(editor.document);
+
+        try {
+            await this.ensureSessionContextForDocument(editor.document);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return { success: false, error: `Failed to bind session context: ${msg}` };
+        }
+
         const text = editor.document.getText();
         const cursorOffset = editor.document.offsetAt(editor.selection.active);
         
@@ -1079,19 +1140,6 @@ export class StepManager implements vscode.Disposable {
         this.log(`Batch stepping forward: ${statements.length} statements to offset ${targetOffset} (startIndex=${startStatementIndex})`);
         
         try {
-            // Ensure process is running
-            if (!this.processManager.isRunning()) {
-                try {
-                    await this.processManager.start();
-                    // Initialize undo tracker when process starts
-                    this.undoStateTracker.initialize(0);
-                } catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    this.proofStateManager.failTransaction(tx, `Failed to start process: ${msg}`);
-                    return { success: false, error: `Failed to start process: ${msg}` };
-                }
-            }
-            
             // Try batched execution first
             const batchedText = statements.map(stmt => stmt.text).join('\n');
             const batchedOutput = await this.sendAndWait(batchedText, editor.document.uri, statements.length);

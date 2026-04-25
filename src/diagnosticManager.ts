@@ -12,6 +12,7 @@
  */
 
 import * as vscode from 'vscode';
+import * as path from 'node:path';
 import { ParsedError, createDiagnostic } from './types';
 import { SyntaxChecker, SyntaxCheckResult } from './syntaxChecker';
 import { ConfigurationManager } from './configurationManager';
@@ -82,6 +83,9 @@ export class DiagnosticManager implements vscode.Disposable {
     
     /** Debounce timers per document */
     private readonly debounceTimers: Map<string, NodeJS.Timeout>;
+
+    /** Tracks all diagnostic target URIs produced by live checks per source document */
+    private readonly liveCheckTargetsBySource: Map<string, Set<string>>;
     
     /** Event emitter for when live check starts */
     private readonly _onDidStartCheck = new vscode.EventEmitter<vscode.Uri>();
@@ -109,6 +113,7 @@ export class DiagnosticManager implements vscode.Disposable {
         this.diagnosticsPerFile = new Map();
         this.modifiedDocuments = new Set();
         this.debounceTimers = new Map();
+        this.liveCheckTargetsBySource = new Map();
         this.disposables = [];
         
         this.options = {
@@ -266,7 +271,7 @@ export class DiagnosticManager implements vscode.Disposable {
             
             if (result.completed) {
                 // Update diagnostics with the result
-                this.setDiagnostics(document.uri, result.errors);
+                this.publishLiveCheckDiagnostics(document.uri, result.errors);
                 this.log(`Live check completed: ${result.errors.length} error(s) in ${result.duration}ms`);
             } else {
                 this.log(`Live check was cancelled or failed`);
@@ -276,6 +281,65 @@ export class DiagnosticManager implements vscode.Disposable {
         } catch (error) {
             this.log(`Live check error: ${error}`);
         }
+    }
+
+    private publishLiveCheckDiagnostics(sourceUri: vscode.Uri, errors: ParsedError[]): void {
+        const groupedByUri = new Map<string, { uri: vscode.Uri; errors: ParsedError[] }>();
+        const normalizedSourcePath = path.resolve(sourceUri.fsPath);
+
+        for (const error of errors) {
+            const targetUri = (() => {
+                if (!error.filePath) {
+                    return sourceUri;
+                }
+
+                try {
+                    const normalizedReportedPath = path.resolve(error.filePath);
+                    if (normalizedReportedPath === normalizedSourcePath) {
+                        return sourceUri;
+                    }
+                } catch {
+                    // Fall through to Uri.file
+                }
+
+                return vscode.Uri.file(error.filePath);
+            })();
+
+            const key = targetUri.toString();
+            const existing = groupedByUri.get(key);
+            if (existing) {
+                existing.errors.push(error);
+            } else {
+                groupedByUri.set(key, { uri: targetUri, errors: [error] });
+            }
+        }
+
+        const sourceKey = sourceUri.toString();
+        const previousTargets = this.liveCheckTargetsBySource.get(sourceKey) ?? new Set<string>();
+        const currentTargets = new Set<string>();
+
+        if (groupedByUri.size === 0) {
+            this.setDiagnostics(sourceUri, []);
+            currentTargets.add(sourceKey);
+        } else {
+            if (!groupedByUri.has(sourceKey)) {
+                this.setDiagnostics(sourceUri, []);
+                currentTargets.add(sourceKey);
+            }
+
+            for (const [key, { uri, errors: groupedErrors }] of groupedByUri.entries()) {
+                this.setDiagnostics(uri, groupedErrors);
+                currentTargets.add(key);
+            }
+        }
+
+        for (const previousTarget of previousTargets) {
+            if (!currentTargets.has(previousTarget)) {
+                this.clearDiagnostics(vscode.Uri.parse(previousTarget));
+            }
+        }
+
+        this.liveCheckTargetsBySource.set(sourceKey, currentTargets);
     }
     
     /**
@@ -303,7 +367,7 @@ export class DiagnosticManager implements vscode.Disposable {
             const result = await this.syntaxChecker.check(document);
             
             if (result.completed) {
-                this.setDiagnostics(document.uri, result.errors);
+                this.publishLiveCheckDiagnostics(document.uri, result.errors);
             }
             
             this._onDidCompleteCheck.fire({ uri: document.uri, result });
@@ -340,6 +404,7 @@ export class DiagnosticManager implements vscode.Disposable {
         const uriString = document.uri.toString();
         this.diagnosticsPerFile.delete(uriString);
         this.modifiedDocuments.delete(uriString);
+        this.liveCheckTargetsBySource.delete(uriString);
         this.diagnosticCollection.delete(document.uri);
     }
 
@@ -459,6 +524,7 @@ export class DiagnosticManager implements vscode.Disposable {
     public clearAll(): void {
         this.diagnosticCollection.clear();
         this.diagnosticsPerFile.clear();
+        this.liveCheckTargetsBySource.clear();
     }
 
     /**
@@ -587,6 +653,7 @@ export class DiagnosticManager implements vscode.Disposable {
         this.diagnosticCollection.dispose();
         this.diagnosticsPerFile.clear();
         this.modifiedDocuments.clear();
+        this.liveCheckTargetsBySource.clear();
         
         for (const disposable of this.disposables) {
             disposable.dispose();

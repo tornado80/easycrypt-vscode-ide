@@ -22,6 +22,13 @@ import { ProofStateViewProvider, PROOF_STATE_VIEW_ID } from './proofStateViewPro
 import { StepManager } from './stepManager';
 import { EditorDecorator } from './editorDecorator';
 import { Logger } from './logger';
+import {
+    SessionContextFingerprint,
+    VerificationContext,
+    buildCompileArgs,
+    fingerprintVerificationContext,
+    resolveVerificationContext
+} from './verificationContextResolver';
 
 /** The diagnostic manager instance */
 let diagnosticManager: DiagnosticManager | undefined;
@@ -63,6 +70,38 @@ function log(message: string): void {
     if (outputChannel) {
         outputChannel.appendLine(`[${new Date().toISOString()}] ${message}`);
     }
+}
+
+function getWorkspaceFolderPath(document: vscode.TextDocument): string | undefined {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+    if (workspaceFolder) {
+        return workspaceFolder.uri.fsPath;
+    }
+
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
+function resolveVerificationContextForDocument(document: vscode.TextDocument): VerificationContext | undefined {
+    if (!configurationManager) {
+        return undefined;
+    }
+
+    const config = configurationManager.getConfig();
+    return resolveVerificationContext({
+        documentPath: document.uri.fsPath,
+        workspaceFolderPath: getWorkspaceFolderPath(document),
+        configArgs: config.arguments,
+        proverArgs: config.proverArgs
+    });
+}
+
+function resolveSessionContextForDocument(document: vscode.TextDocument): SessionContextFingerprint | undefined {
+    const context = resolveVerificationContextForDocument(document);
+    if (!context) {
+        return undefined;
+    }
+
+    return fingerprintVerificationContext(context);
 }
 
 /**
@@ -291,13 +330,31 @@ function registerCommands(context: vscode.ExtensionContext): void {
                 return;
             }
             try {
+                const activeDocument = vscode.window.activeTextEditor?.document;
+                const sessionContext = activeDocument?.languageId === 'easycrypt'
+                    ? resolveSessionContextForDocument(activeDocument)
+                    : undefined;
+
                 if (processManager.isRunning()) {
-                    await processManager.restart();
-                    logger?.commandComplete('easycrypt.startProcess', true, { action: 'restart' });
+                    if (sessionContext) {
+                        log(`Manual restart with context cwd=${sessionContext.workingDirectory}`);
+                        await processManager.restart(sessionContext);
+                        logger?.commandComplete('easycrypt.startProcess', true, { action: 'restart-with-context' });
+                    } else {
+                        await processManager.restart();
+                        logger?.commandComplete('easycrypt.startProcess', true, { action: 'restart' });
+                    }
                 } else {
-                    await processManager.start();
+                    if (sessionContext) {
+                        log(`Manual start with context cwd=${sessionContext.workingDirectory}`);
+                        await processManager.start(sessionContext);
+                    } else {
+                        await processManager.start();
+                    }
                     vscode.window.showInformationMessage('EasyCrypt process started');
-                    logger?.commandComplete('easycrypt.startProcess', true, { action: 'start' });
+                    logger?.commandComplete('easycrypt.startProcess', true, {
+                        action: sessionContext ? 'start-with-context' : 'start'
+                    });
                 }
             } catch (error) {
                 const msg = error instanceof Error ? error.message : String(error);
@@ -591,9 +648,6 @@ async function checkDocument(document: vscode.TextDocument): Promise<void> {
     updateStatusBar('checking');
 
     try {
-        // Use easycrypt compile for one-shot file checking
-        const config = configurationManager?.getConfig();
-
         // Resolve and validate executable path (don't rely on raw config string).
         if (!configurationManager) {
             updateStatusBar('error');
@@ -611,24 +665,22 @@ async function checkDocument(document: vscode.TextDocument): Promise<void> {
         }
 
         const execPath = validation.resolvedPath || configurationManager.getExecutablePath();
+        const verificationContext = resolveVerificationContextForDocument(document);
+        if (!verificationContext) {
+            updateStatusBar('error');
+            vscode.window.showErrorMessage('EasyCrypt: Failed to resolve verification context');
+            return;
+        }
         
         const { spawn } = await import('child_process');
         
         log(`Checking file: ${document.uri.fsPath}`);
-        
-        const args: string[] = ['compile', '-script'];
-
-        // Add user arguments and prover args *before* the file path (typical CLI convention).
-        if (config?.arguments?.length) {
-            args.push(...config.arguments);
-        }
-        if (config?.proverArgs?.length) {
-            args.push(...config.proverArgs);
-        }
-
-        args.push(document.uri.fsPath);
+        log(`Check context: cwd=${verificationContext.workingDirectory}`);
+        log(`Check include roots: ${verificationContext.includeRoots.join(', ') || '<none>'}`);
+        const args = buildCompileArgs(verificationContext, document.uri.fsPath);
 
         const child = spawn(execPath, args, {
+            cwd: verificationContext.workingDirectory,
             stdio: ['ignore', 'pipe', 'pipe']
         });
 
@@ -885,7 +937,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
     context.subscriptions.push(editorDecorator);
 
     // Initialize step manager
-    stepManager = new StepManager(processManager, proofStateManager, editorDecorator, outputChannel);
+    stepManager = new StepManager(
+        processManager,
+        proofStateManager,
+        editorDecorator,
+        configurationManager,
+        outputChannel
+    );
     context.subscriptions.push(stepManager);
 
     // Initialize proof state view provider
@@ -924,17 +982,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
                 return;
             }
 
-            if (processManager.isRunning()) {
+            const sessionContext = resolveSessionContextForDocument(editor.document);
+            if (!sessionContext) {
+                log('Auto-start skipped: unable to resolve session context for active document');
                 return;
             }
 
             try {
-                const validation = await configurationManager.validateExecutablePath();
-                if (!validation.valid) {
-                    log(`Auto-start skipped: ${validation.error ?? 'invalid executable path'}`);
-                    return;
+                if (!processManager.isRunning()) {
+                    const validation = await configurationManager.validateExecutablePath();
+                    if (!validation.valid) {
+                        log(`Auto-start skipped: ${validation.error ?? 'invalid executable path'}`);
+                        return;
+                    }
                 }
-                await processManager.start();
+
+                await processManager.ensureSessionContext(sessionContext);
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
                 log(`Auto-start failed: ${msg}`);

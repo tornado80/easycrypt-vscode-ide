@@ -14,6 +14,7 @@ function run() {
   // Add all e2e test files
   mocha.addFile(path.resolve(testsRoot, 'easycrypt.e2e.test.js'));
   mocha.addFile(path.resolve(testsRoot, 'diagnostics.e2e.test.js'));
+  mocha.addFile(path.resolve(testsRoot, 'moduleImports.e2e.test.js'));
   mocha.addFile(path.resolve(testsRoot, 'proofNavigation.e2e.test.js'));
   mocha.addFile(path.resolve(testsRoot, 'proofNavigation.real.e2e.test.js'));
   mocha.addFile(path.resolve(testsRoot, 'proofNavigationButtons.e2e.test.js'));

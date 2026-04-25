@@ -33,6 +33,29 @@ async function waitForProofStateSettled(timeoutMs = 120_000) {
   return vscode.commands.executeCommand('easycrypt._getProofStateSnapshot');
 }
 
+async function resolveEasycryptPath() {
+  return process.env.EASYCRYPT_PATH || process.env.EASYCRYPT_REAL_PATH || (await which('easycrypt'));
+}
+
+function getErrorDiagnostics(uri) {
+  return vscode.languages
+    .getDiagnostics(uri)
+    .filter((diag) => diag.severity === vscode.DiagnosticSeverity.Error);
+}
+
+async function waitForNoErrorDiagnostics(uri, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const errors = getErrorDiagnostics(uri);
+    if (errors.length === 0) {
+      return errors;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  return getErrorDiagnostics(uri);
+}
+
 describe('Interactive Proof Navigation E2E (real easycrypt)', function () {
   this.timeout(240_000);
 
@@ -98,6 +121,79 @@ describe('Interactive Proof Navigation E2E (real easycrypt)', function () {
       assert.ok(
         /added predicate\s+inv/i.test(text),
         `Expected final tail output to include "added predicate inv". Got:\n${text.slice(-2000)}`
+      );
+    } finally {
+      await vscode.commands.executeCommand('easycrypt.stopProcess');
+    }
+  });
+
+  it('KEMDEM_lor.ec check and stepping remain import-resolved across directory switch', async function () {
+    const easycryptPath = await resolveEasycryptPath();
+    if (!easycryptPath) {
+      this.skip();
+      return;
+    }
+
+    await configureRealEasyCrypt(easycryptPath);
+
+    const ext = vscode.extensions.getExtension('tornado.easycrypt-vscode');
+    assert.ok(ext, 'Extension tornado.easycrypt-vscode should be present');
+    await ext.activate();
+
+    const kemDemPath = path.resolve(
+      __dirname,
+      '..',
+      '..',
+      '..',
+      'test',
+      'kem-dem',
+      'left-or-right',
+      'KEMDEM_lor.ec'
+    );
+    const prgPath = path.resolve(__dirname, '..', '..', '..', 'test', 'PRG.ec');
+
+    const kemDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(kemDemPath));
+    await vscode.languages.setTextDocumentLanguage(kemDoc, 'easycrypt');
+    await vscode.window.showTextDocument(kemDoc);
+
+    try {
+      await vscode.commands.executeCommand('easycrypt.clearAllDiagnostics');
+      await vscode.commands.executeCommand('easycrypt.checkFile');
+      await new Promise((r) => setTimeout(r, 600));
+
+      const postCheckErrors = await waitForNoErrorDiagnostics(kemDoc.uri, 30_000);
+      assert.equal(
+        postCheckErrors.length,
+        0,
+        `Expected no error diagnostics after checkFile on KEMDEM_lor.ec, got: ${JSON.stringify(postCheckErrors.map((d) => d.message))}`
+      );
+
+      await vscode.commands.executeCommand('easycrypt.resetProof');
+
+      const step1 = await vscode.commands.executeCommand('easycrypt.stepForward');
+      const step2 = await vscode.commands.executeCommand('easycrypt.stepForward');
+      assert.ok(step1 && step1.success, `Expected first KEMDEM stepForward success, got: ${JSON.stringify(step1)}`);
+      assert.ok(step2 && step2.success, `Expected second KEMDEM stepForward success, got: ${JSON.stringify(step2)}`);
+
+      const prgDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(prgPath));
+      await vscode.languages.setTextDocumentLanguage(prgDoc, 'easycrypt');
+      await vscode.window.showTextDocument(prgDoc);
+
+      const prgStep = await vscode.commands.executeCommand('easycrypt.stepForward');
+      assert.ok(prgStep && prgStep.success, `Expected PRG stepForward success after switch, got: ${JSON.stringify(prgStep)}`);
+
+      await vscode.window.showTextDocument(kemDoc);
+      const stepAfterReturn = await vscode.commands.executeCommand('easycrypt.stepForward');
+      assert.ok(
+        stepAfterReturn && stepAfterReturn.success,
+        `Expected KEMDEM stepForward success after returning from PRG, got: ${JSON.stringify(stepAfterReturn)}`
+      );
+
+      const finalErrors = getErrorDiagnostics(kemDoc.uri);
+      assert.equal(
+        finalErrors.length,
+        0,
+        `Expected no KEMDEM error diagnostics after stepping and directory switch, got: ${JSON.stringify(finalErrors.map((d) => d.message))}`
       );
     } finally {
       await vscode.commands.executeCommand('easycrypt.stopProcess');

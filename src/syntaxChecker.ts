@@ -18,6 +18,7 @@ import * as crypto from 'crypto';
 import { parseOutput } from './outputParser';
 import { ParsedError } from './parserTypes';
 import { ConfigurationManager } from './configurationManager';
+import { buildCompileArgs, resolveVerificationContext } from './verificationContextResolver';
 
 const writeFile = promisify(fs.writeFile);
 const unlink = promisify(fs.unlink);
@@ -112,6 +113,15 @@ export class SyntaxChecker implements vscode.Disposable {
         if (this.outputChannel) {
             this.outputChannel.appendLine(`[SyntaxChecker] ${message}`);
         }
+    }
+
+    private getWorkspaceFolderPath(document: vscode.TextDocument): string | undefined {
+        const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+        if (workspaceFolder) {
+            return workspaceFolder.uri.fsPath;
+        }
+
+        return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     }
 
     /**
@@ -267,14 +277,27 @@ export class SyntaxChecker implements vscode.Disposable {
         
         // Build command arguments.
         // Use `compile -script` for stable, machine-readable diagnostics.
-        // Some EasyCrypt builds do not accept `-emacs` as a top-level option.
-        const args = ['compile', '-script', ...config.arguments, tempPath];
-        
+        const context = resolveVerificationContext({
+            documentPath: document.uri.fsPath,
+            workspaceFolderPath: this.getWorkspaceFolderPath(document),
+            configArgs: config.arguments,
+            proverArgs: config.proverArgs
+        });
+        const args = buildCompileArgs(context, tempPath);
+
         this.log(`Running: ${resolvedExec} ${args.join(' ')}`);
+        this.log(`Live check context: cwd=${context.workingDirectory}; includeRoots=[${context.includeRoots.join(', ') || '<none>'}]`);
+        this.log(`Snapshot mapping: source=${document.uri.fsPath} <-> shadow=${tempPath}`);
         
         // Run EasyCrypt
         try {
-            const result = await this.runEasyCrypt(resolvedExec, args, token, tempPath);
+            const result = await this.runEasyCrypt(
+                resolvedExec,
+                args,
+                token,
+                tempPath,
+                context.workingDirectory
+            );
             
             // Remap file paths from temp file to original document
             const remappedErrors = this.remapFilePaths(
@@ -307,7 +330,8 @@ export class SyntaxChecker implements vscode.Disposable {
         execPath: string,
         args: string[],
         token: vscode.CancellationToken,
-        tempPath: string
+        tempPath: string,
+        workingDirectory: string
     ): Promise<{ errors: ParsedError[]; completed: boolean }> {
         return new Promise((resolve) => {
             let stdout = '';
@@ -315,7 +339,7 @@ export class SyntaxChecker implements vscode.Disposable {
             let completed = false;
             
             const childProcess = spawn(execPath, args, {
-                cwd: path.dirname(tempPath),
+                cwd: workingDirectory,
                 env: { ...globalThis.process.env },
                 stdio: ['pipe', 'pipe', 'pipe']
             });

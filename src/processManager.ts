@@ -12,6 +12,13 @@ import { spawn, ChildProcess } from 'child_process';
 import { ConfigurationManager } from './configurationManager';
 import { parseOutput } from './outputParser';
 import { ParseResult } from './parserTypes';
+import {
+    SessionContextFingerprint,
+    buildCliArgs,
+    cloneSessionContextFingerprint,
+    normalizeCommandArgs,
+    sessionContextEquals
+} from './verificationContextResolver';
 
 /**
  * Events emitted by the ProcessManager
@@ -95,6 +102,9 @@ export class ProcessManager implements vscode.Disposable {
     /** Total number of sendCommand() invocations (useful for deterministic tests) */
     private sendCommandCount: number = 0;
 
+    /** Active REPL context (cwd/include roots/user args) for this process lifecycle */
+    private activeSessionContext: SessionContextFingerprint | undefined;
+
     /** Event emitters */
     private readonly _onOutput = new vscode.EventEmitter<ProcessOutput>();
     private readonly _onDidStart = new vscode.EventEmitter<void>();
@@ -124,7 +134,16 @@ export class ProcessManager implements vscode.Disposable {
         const configDisposable = this.configManager.onDidChangeConfiguration(async () => {
             if (this.isRunning()) {
                 this.log('Configuration changed, restarting process...');
-                await this.restart();
+                if (this.activeSessionContext) {
+                    this.activeSessionContext = {
+                        ...this.activeSessionContext,
+                        normalizedUserArgs: normalizeCommandArgs(
+                            this.configManager.getArguments(),
+                            this.configManager.getProverArgs()
+                        )
+                    };
+                }
+                await this.restart(this.activeSessionContext);
             }
         });
         this.disposables.push(configDisposable);
@@ -149,7 +168,7 @@ export class ProcessManager implements vscode.Disposable {
      * 
      * @throws Error if the executable path is invalid
      */
-    public async start(): Promise<void> {
+    public async start(sessionContext?: SessionContextFingerprint): Promise<void> {
         if (this.isRunning()) {
             this.log('Process already running');
             return;
@@ -165,12 +184,19 @@ export class ProcessManager implements vscode.Disposable {
         }
 
         const execPath = validation.resolvedPath || this.configManager.getExecutablePath();
-        const args = this.buildArgs();
+        const effectiveContext = sessionContext
+            ? cloneSessionContextFingerprint(sessionContext)
+            : (this.activeSessionContext
+                ? cloneSessionContextFingerprint(this.activeSessionContext)
+                : undefined);
+        const args = this.buildArgs(effectiveContext);
 
         this.log(`Starting EasyCrypt: ${execPath} ${args.join(' ')}`);
+        this.logSessionContext('Starting process context', effectiveContext);
 
         try {
             this.process = spawn(execPath, args, {
+                cwd: effectiveContext?.workingDirectory,
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env: { ...process.env }
             });
@@ -179,6 +205,7 @@ export class ProcessManager implements vscode.Disposable {
             this.stoppingIntentionally = false;
 
             this.processStartCount++;
+            this.activeSessionContext = effectiveContext;
 
             this._onDidStart.fire();
             this.log(`EasyCrypt process started (PID: ${this.process.pid})`);
@@ -208,9 +235,41 @@ export class ProcessManager implements vscode.Disposable {
     }
 
     /**
+     * Returns the currently bound session context, if any.
+     * Intended for internal diagnostics/testing.
+     */
+    public getSessionContextFingerprint(): SessionContextFingerprint | undefined {
+        if (!this.activeSessionContext) {
+            return undefined;
+        }
+
+        return cloneSessionContextFingerprint(this.activeSessionContext);
+    }
+
+    private logSessionContext(prefix: string, context: SessionContextFingerprint | undefined): void {
+        if (!context) {
+            this.log(`${prefix}: <none>`);
+            return;
+        }
+
+        const includeRoots = context.includeRoots.length > 0
+            ? context.includeRoots.join(', ')
+            : '<none>';
+        const userArgs = context.normalizedUserArgs.length > 0
+            ? context.normalizedUserArgs.join(' ')
+            : '<none>';
+
+        this.log(`${prefix}: cwd=${context.workingDirectory}; includeRoots=[${includeRoots}]; userArgs=${userArgs}`);
+    }
+
+    /**
      * Builds command-line arguments for the EasyCrypt process
      */
-    private buildArgs(): string[] {
+    private buildArgs(sessionContext?: SessionContextFingerprint): string[] {
+        if (sessionContext) {
+            return buildCliArgs(sessionContext);
+        }
+
         const config = this.configManager.getConfig();
         const args: string[] = ['cli', '-emacs']; // Use CLI mode with emacs-friendly output
 
@@ -432,13 +491,43 @@ export class ProcessManager implements vscode.Disposable {
     /**
      * Restarts the EasyCrypt process
      */
-    public async restart(): Promise<void> {
+    public async restart(sessionContext?: SessionContextFingerprint): Promise<void> {
         this.log('Restarting EasyCrypt process...');
 
         await this.stopAndWait(4000);
 
-        await this.start();
+        const context = sessionContext
+            ? cloneSessionContextFingerprint(sessionContext)
+            : (this.activeSessionContext
+                ? cloneSessionContextFingerprint(this.activeSessionContext)
+                : undefined);
+        await this.start(context);
         vscode.window.showInformationMessage('EasyCrypt process restarted');
+    }
+
+    /**
+     * Ensures that the running process is bound to the requested session context.
+     * If context differs, performs a controlled stop/start rebind.
+     */
+    public async ensureSessionContext(sessionContext: SessionContextFingerprint): Promise<void> {
+        const requested = cloneSessionContextFingerprint(sessionContext);
+
+        if (!this.isRunning()) {
+            this.log('Process is not running; starting with requested session context.');
+            await this.start(requested);
+            return;
+        }
+
+        if (!sessionContextEquals(this.activeSessionContext, requested)) {
+            this.log('Session context mismatch detected; rebinding process context.');
+            this.logSessionContext('Current session context', this.activeSessionContext);
+            this.logSessionContext('Requested session context', requested);
+            await this.stopAndWait(4000);
+            await this.start(requested);
+            return;
+        }
+
+        this.log('Session context already matches requested context.');
     }
 
     /**
@@ -517,6 +606,7 @@ export class ProcessManager implements vscode.Disposable {
      */
     public dispose(): void {
         this.stop();
+        this.activeSessionContext = undefined;
         this._onOutput.dispose();
         this._onDidStart.dispose();
         this._onDidStop.dispose();
