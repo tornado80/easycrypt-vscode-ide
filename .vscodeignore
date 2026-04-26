@@ -3,7 +3,6 @@
 .github/**
 src/**
 test/**
-node_modules/**
 *.vsix
 .gitignore
 tsconfig.json
