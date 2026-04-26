@@ -251,6 +251,51 @@
           "description": "Arguments specifically for backend provers (Alt-Ergo, Z3, etc.) if passed through EasyCrypt.",
           "scope": "window"
         },
+        "easycrypt.communication.channel": {
+          "type": "string",
+          "enum": [
+            "emacs",
+            "lsp",
+            "auto"
+          ],
+          "default": "emacs",
+          "description": "Select proof communication channel: emacs (cli -emacs), lsp, or auto (safe compatibility-based selection).",
+          "scope": "window"
+        },
+        "easycrypt.lsp.serverArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional command-line arguments for EasyCrypt LSP mode.",
+          "scope": "window"
+        },
+        "easycrypt.lsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace level for EasyCrypt LSP client/server protocol logging.",
+          "scope": "window"
+        },
+        "easycrypt.lsp.requestTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "maximum": 300000,
+          "description": "Timeout in milliseconds for EasyCrypt LSP proof/query requests.",
+          "scope": "window"
+        },
+        "easycrypt.lsp.logToFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable EasyCrypt LSP file logging via EASYCRYPT_LSP_LOG=1.",
+          "scope": "window"
+        },
         "easycrypt.diagnostics.enabled": {
           "type": "boolean",
           "default": true,
@@ -325,6 +370,9 @@
     "typescript": "^5.3.0",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
   },
   "overrides": {
     "serialize-javascript": "^7.0.5"

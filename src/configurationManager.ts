@@ -11,6 +11,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
+import { CommunicationChannel } from './channelSelectionPolicy';
 
 const access = promisify(fs.access);
 
@@ -37,6 +38,16 @@ export interface EasyCryptConfig {
     checkOnChange: boolean;
     /** Whether to check on document save */
     checkOnSave: boolean;
+    /** Preferred proof communication channel */
+    communicationChannel: CommunicationChannel;
+    /** Additional arguments to pass to the EasyCrypt LSP server */
+    lspServerArgs: string[];
+    /** LSP server trace verbosity */
+    lspTraceServer: 'off' | 'messages' | 'verbose';
+    /** Timeout for LSP requests in milliseconds */
+    lspRequestTimeoutMs: number;
+    /** Whether to enable EasyCrypt LSP log file output */
+    lspLogToFile: boolean;
 }
 
 /**
@@ -120,7 +131,12 @@ export class ConfigurationManager implements vscode.Disposable {
             liveChecksEnabled: config.get<boolean>('diagnostics.liveChecks', true),
             liveCheckDelay: config.get<number>('diagnostics.delay', 500),
             checkOnChange: config.get<boolean>('diagnostics.onChange', true),
-            checkOnSave: config.get<boolean>('diagnostics.onSave', true)
+            checkOnSave: config.get<boolean>('diagnostics.onSave', true),
+            communicationChannel: config.get<CommunicationChannel>('communication.channel', 'emacs'),
+            lspServerArgs: config.get<string[]>('lsp.serverArgs', []),
+            lspTraceServer: config.get<'off' | 'messages' | 'verbose'>('lsp.trace.server', 'off'),
+            lspRequestTimeoutMs: config.get<number>('lsp.requestTimeoutMs', 30000),
+            lspLogToFile: config.get<boolean>('lsp.logToFile', true)
         };
 
         return this.cachedConfig;
@@ -197,6 +213,41 @@ export class ConfigurationManager implements vscode.Disposable {
      */
     public isCheckOnSaveEnabled(): boolean {
         return this.getConfig().checkOnSave;
+    }
+
+    /**
+     * Gets the preferred proof communication channel
+     */
+    public getCommunicationChannel(): CommunicationChannel {
+        return this.getConfig().communicationChannel;
+    }
+
+    /**
+     * Gets additional LSP server arguments
+     */
+    public getLspServerArgs(): string[] {
+        return this.getConfig().lspServerArgs;
+    }
+
+    /**
+     * Gets the LSP trace verbosity
+     */
+    public getLspTraceServer(): 'off' | 'messages' | 'verbose' {
+        return this.getConfig().lspTraceServer;
+    }
+
+    /**
+     * Gets the LSP request timeout in milliseconds
+     */
+    public getLspRequestTimeoutMs(): number {
+        return this.getConfig().lspRequestTimeoutMs;
+    }
+
+    /**
+     * Checks whether LSP should log to file
+     */
+    public isLspLogToFileEnabled(): boolean {
+        return this.getConfig().lspLogToFile;
     }
 
     /**

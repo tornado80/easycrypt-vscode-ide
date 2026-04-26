@@ -3,17 +3,17 @@ import { ConfigurationManager } from './configurationManager';
 import { DecorationProjectionService } from './decorationProjectionService';
 import { DiagnosticManager } from './diagnosticManager';
 import { Logger } from './logger';
+import { ManagedProofSession } from './managedProofSession';
 import { ProcessManager, ProcessOutput } from './processManager';
 import { ProofStateManager } from './proofStateManager';
-import { StepDecorationSink, StepManager } from './stepManager';
+import { StepDecorationSink, StepManager, StepResult } from './stepManager';
 import { FileSessionKey } from './sessionKey';
+import { SessionStopReason } from './sessionRegistry';
 import {
     SessionContextFingerprint,
     fingerprintVerificationContext,
     resolveVerificationContext
 } from './verificationContextResolver';
-
-export type SessionStopReason = 'file-close' | 'manual-stop' | 'config-change' | 'shutdown';
 
 export interface EasyCryptFileSessionOptions {
     readonly key: FileSessionKey;
@@ -76,9 +76,10 @@ class ProjectionDecorationSink implements StepDecorationSink {
     }
 }
 
-export class EasyCryptFileSession implements vscode.Disposable {
+export class EasyCryptFileSession implements ManagedProofSession {
     public readonly key: FileSessionKey;
     public readonly documentUri: vscode.Uri;
+    public readonly channel = 'emacs' as const;
     public readonly processManager: ProcessManager;
     public readonly proofStateManager: ProofStateManager;
     public readonly stepManager: StepManager;
@@ -180,9 +181,109 @@ export class EasyCryptFileSession implements vscode.Disposable {
         await this.processManager.stopAndWait(4000);
     }
 
-    public async restart(): Promise<void> {
+    public async restart(_token?: vscode.CancellationToken): Promise<void> {
         this.throwIfDisposed();
         await this.processManager.restart(this.buildSessionContext());
+    }
+
+    public async syncDocumentOpen(document: vscode.TextDocument): Promise<void> {
+        if (document.uri.toString() !== this.documentUri.toString()) {
+            return;
+        }
+
+        this.stepManager.setDocument(document);
+    }
+
+    public async syncDocumentChange(_event: vscode.TextDocumentChangeEvent): Promise<void> {
+        // StepManager already listens to document change events and handles auto-retraction.
+    }
+
+    public async syncDocumentClose(_document: vscode.TextDocument): Promise<void> {
+        // No transport-level document sync needed in emacs mode.
+    }
+
+    public async stepForward(token?: vscode.CancellationToken): Promise<StepResult> {
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: stepForward');
+        }
+
+        await this.ensureStarted(token);
+        const result = await this.stepManager.stepForward();
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: stepForward');
+        }
+        return result;
+    }
+
+    public async stepBackward(token?: vscode.CancellationToken): Promise<StepResult> {
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: stepBackward');
+        }
+
+        await this.ensureStarted(token);
+        const result = await this.stepManager.stepBackward();
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: stepBackward');
+        }
+        return result;
+    }
+
+    public async goToCursor(token?: vscode.CancellationToken): Promise<StepResult> {
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: goToCursor');
+        }
+
+        await this.ensureStarted(token);
+        const result = await this.stepManager.goToCursor();
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: goToCursor');
+        }
+        return result;
+    }
+
+    public async resetProof(token?: vscode.CancellationToken): Promise<StepResult> {
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: resetProof');
+        }
+
+        this.stepManager.reset();
+        if (this.processManager.isRunning()) {
+            await this.restart();
+        }
+
+        return {
+            success: true,
+            executionOffset: this.stepManager.getExecutionOffset()
+        };
+    }
+
+    public async forceRecovery(token?: vscode.CancellationToken): Promise<StepResult> {
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: forceRecovery');
+        }
+
+        await this.ensureStarted(token);
+        const result = await this.stepManager.forceRecovery();
+        if (token?.isCancellationRequested) {
+            throw new Error('Command cancelled: forceRecovery');
+        }
+        return result;
+    }
+
+    public isRuntimeRunning(): boolean {
+        return this.processManager.isRunning();
+    }
+
+    public getExecutionOffset(): number {
+        return this.stepManager.getExecutionOffset();
+    }
+
+    public getProcessStartCount(): number {
+        return this.processManager.getProcessStartCount();
+    }
+
+    public getSendCommandCount(): number {
+        return this.processManager.getSendCommandCount();
     }
 
     private handleProcessOutput(output: ProcessOutput): void {

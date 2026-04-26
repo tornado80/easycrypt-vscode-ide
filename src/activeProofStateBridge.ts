@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import { EasyCryptFileSession } from './easyCryptFileSession';
 import { Logger } from './logger';
+import { ManagedProofSession } from './managedProofSession';
 import { ProofState } from './proofStateManager';
 import { ProofStateViewProvider } from './proofStateViewProvider';
 import { SessionRegistry } from './sessionRegistry';
@@ -20,7 +20,7 @@ export class ActiveProofStateBridge implements vscode.Disposable {
     private readonly disposables: vscode.Disposable[] = [];
 
     constructor(
-        private readonly registry: SessionRegistry<vscode.TextDocument, EasyCryptFileSession>,
+        private readonly registry: SessionRegistry<vscode.TextDocument, ManagedProofSession>,
         private readonly provider: ProofStateViewProvider,
         private readonly logger?: Logger
     ) {
@@ -33,7 +33,7 @@ export class ActiveProofStateBridge implements vscode.Disposable {
         this.bindActiveSession(this.registry.getActiveSession());
     }
 
-    private bindActiveSession(session: EasyCryptFileSession | undefined): void {
+    private bindActiveSession(session: ManagedProofSession | undefined): void {
         if (this.activeStateDisposable) {
             this.activeStateDisposable.dispose();
             this.activeStateDisposable = undefined;

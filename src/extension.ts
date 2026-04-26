@@ -10,20 +10,30 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { ActiveProofStateBridge } from './activeProofStateBridge';
+import {
+    CommunicationChannel,
+    DefaultChannelSelectionPolicy,
+    ResolvedCommunicationChannel
+} from './channelSelectionPolicy';
 import { DecorationProjectionService } from './decorationProjectionService';
 import { DiagnosticManager } from './diagnosticManager';
 import { EasyCryptFileSession } from './easyCryptFileSession';
+import { LspFileSession } from './lspFileSession';
+import { LspClientManager, LspManagerConfig } from './lspClientManager';
+import { LspProofTransport } from './lspProofTransport';
+import { ManagedProofSession } from './managedProofSession';
 import { parseOutput } from './outputParser';
 import { 
     ConfigurationManager, 
     getConfigurationManager, 
     disposeConfigurationManager 
 } from './configurationManager';
-import { ProofStateViewProvider, PROOF_STATE_VIEW_ID } from './proofStateViewProvider';
+import { ProofStateViewProvider, PROOF_STATE_VIEW_ID, WebviewToExtensionMessage } from './proofStateViewProvider';
 import { EditorDecorator } from './editorDecorator';
 import { Logger } from './logger';
-import { SessionCommandRouter } from './sessionCommandRouter';
+import { SessionCancellationToken, SessionCommandRouter } from './sessionCommandRouter';
 import { SessionRegistry } from './sessionRegistry';
+import { StepResult } from './stepManager';
 import {
     VerificationContext,
     buildCompileArgs,
@@ -37,10 +47,19 @@ let diagnosticManager: DiagnosticManager | undefined;
 let configurationManager: ConfigurationManager | undefined;
 
 /** Per-file session registry */
-let sessionRegistry: SessionRegistry<vscode.TextDocument, EasyCryptFileSession> | undefined;
+let sessionRegistry: SessionRegistry<vscode.TextDocument, ManagedProofSession> | undefined;
 
 /** Command router for active per-file sessions */
-let sessionCommandRouter: SessionCommandRouter<EasyCryptFileSession> | undefined;
+let sessionCommandRouter: SessionCommandRouter<ManagedProofSession> | undefined;
+
+/** Shared channel selection policy */
+const channelSelectionPolicy = new DefaultChannelSelectionPolicy();
+
+/** Shared LSP client lifecycle owner */
+let lspClientManager: LspClientManager | undefined;
+
+/** Cached communication setting signature for switch detection */
+let communicationSettingsSignature = '';
 
 /** The proof state view provider instance */
 let proofStateViewProvider: ProofStateViewProvider | undefined;
@@ -112,7 +131,7 @@ function getActiveEasyCryptEditor(): vscode.TextEditor | undefined {
 
 async function ensureActiveSessionForEditor(
     editor: vscode.TextEditor | undefined
-): Promise<EasyCryptFileSession | undefined> {
+): Promise<ManagedProofSession | undefined> {
     if (!editor || editor.document.languageId !== 'easycrypt' || !sessionRegistry) {
         return undefined;
     }
@@ -120,7 +139,7 @@ async function ensureActiveSessionForEditor(
     return sessionRegistry.setActiveDocument(editor.document);
 }
 
-async function requireActiveSession(): Promise<EasyCryptFileSession | undefined> {
+async function requireActiveSession(): Promise<ManagedProofSession | undefined> {
     const editor = getActiveEasyCryptEditor();
     if (!editor) {
         vscode.window.showWarningMessage('Open an EasyCrypt file first');
@@ -134,6 +153,92 @@ async function requireActiveSession(): Promise<EasyCryptFileSession | undefined>
     }
 
     return session;
+}
+
+function toVscodeCancellationToken(token: SessionCancellationToken): vscode.CancellationToken {
+    return {
+        get isCancellationRequested() {
+            return token.isCancellationRequested;
+        },
+        onCancellationRequested(listener, thisArgs, disposables) {
+            const disposable = token.onCancellationRequested(() => {
+                listener.call(thisArgs, undefined);
+            });
+
+            const vscodeDisposable = new vscode.Disposable(() => {
+                disposable.dispose();
+            });
+
+            if (disposables) {
+                disposables.push(vscodeDisposable);
+            }
+
+            return vscodeDisposable;
+        }
+    };
+}
+
+function getCommunicationSettingsSignature(config: ReturnType<ConfigurationManager['getConfig']>): string {
+    return JSON.stringify({
+        channel: config.communicationChannel,
+        lspServerArgs: config.lspServerArgs,
+        lspTraceServer: config.lspTraceServer,
+        lspRequestTimeoutMs: config.lspRequestTimeoutMs,
+        lspLogToFile: config.lspLogToFile,
+        args: config.arguments,
+        proverArgs: config.proverArgs
+    });
+}
+
+function resolvePreferredChannel(_document: vscode.TextDocument): {
+    readonly channel: ResolvedCommunicationChannel;
+    readonly preferred: CommunicationChannel;
+    readonly reason: string;
+    readonly hasCompatibilityRisk: boolean;
+} {
+    if (!configurationManager) {
+        return {
+            channel: 'emacs',
+            preferred: 'emacs',
+            reason: 'configuration-unavailable',
+            hasCompatibilityRisk: false
+        };
+    }
+
+    const config = configurationManager.getConfig();
+    const decision = channelSelectionPolicy.resolvePreferredChannel({
+        preferredChannel: config.communicationChannel,
+        configArgs: config.arguments,
+        proverArgs: config.proverArgs
+    });
+
+    return {
+        channel: decision.channel,
+        preferred: config.communicationChannel,
+        reason: decision.reason,
+        hasCompatibilityRisk: decision.hasCompatibilityRisk
+    };
+}
+
+function getLspManagerConfig(): LspManagerConfig {
+    if (!configurationManager) {
+        return {
+            executablePath: 'easycrypt',
+            serverArgs: [],
+            traceServer: 'off',
+            requestTimeoutMs: 30000,
+            enableLogFile: true
+        };
+    }
+
+    const config = configurationManager.getConfig();
+    return {
+        executablePath: config.executablePath,
+        serverArgs: config.lspServerArgs,
+        traceServer: config.lspTraceServer,
+        requestTimeoutMs: config.lspRequestTimeoutMs,
+        enableLogFile: config.lspLogToFile
+    };
 }
 
 /**
@@ -266,12 +371,14 @@ function registerCommands(context: vscode.ExtensionContext): void {
     const runRoutedStepCommand = async (
         routedName: 'stepForward' | 'stepBackward' | 'goToCursor' | 'resetProof' | 'forceRecovery',
         commandId: string,
-        run: (session: EasyCryptFileSession) => Promise<any>
-    ): Promise<any> => {
+        run: (session: ManagedProofSession, token: vscode.CancellationToken) => Promise<StepResult>
+    ): Promise<StepResult | undefined> => {
         if (!sessionCommandRouter) {
             vscode.window.showErrorMessage('EasyCrypt: Session command router not initialized');
             return undefined;
         }
+
+        const router = sessionCommandRouter;
 
         const session = await requireActiveSession();
         if (!session) {
@@ -285,25 +392,32 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
         logger?.command(commandId, {
             sessionKey: session.key,
-            executionOffset: session.stepManager.getExecutionOffset(),
-            cursorOffset
+            executionOffset: session.getExecutionOffset(),
+            cursorOffset,
+            channel: session.channel
         });
 
-        try {
-            const result = await sessionCommandRouter.runOnActiveSession(
+        const execute = async (): Promise<StepResult> => {
+            return router.runOnActiveSession(
                 routedName,
                 async (activeSession, token) => {
                     if (token.isCancellationRequested) {
                         throw new Error('Command cancelled');
                     }
-                    return run(activeSession);
+
+                    return run(activeSession, toVscodeCancellationToken(token));
                 }
             );
+        };
+
+        try {
+            const result = await execute();
 
             logger?.commandComplete(commandId, Boolean(result?.success ?? true), {
                 sessionKey: session.key,
                 executionOffset: result?.executionOffset,
-                error: result?.error
+                error: result?.error,
+                channel: session.channel
             });
 
             if (result?.success === false && result.error) {
@@ -315,7 +429,8 @@ function registerCommands(context: vscode.ExtensionContext): void {
             const msg = error instanceof Error ? error.message : String(error);
             logger?.commandComplete(commandId, false, {
                 sessionKey: session.key,
-                error: msg
+                error: msg,
+                channel: session.channel
             });
 
             if (msg !== 'No active EasyCrypt file') {
@@ -424,27 +539,32 @@ function registerCommands(context: vscode.ExtensionContext): void {
             }
 
             try {
-                if (session.processManager.isRunning()) {
+                if (session.isRuntimeRunning()) {
                     await session.restart();
                     logger?.commandComplete('easycrypt.startProcess', true, {
                         action: 'restart',
-                        sessionKey: session.key
+                        sessionKey: session.key,
+                        channel: session.channel
                     });
                     return;
                 }
 
                 await session.ensureStarted();
-                vscode.window.showInformationMessage('EasyCrypt process started');
+                vscode.window.showInformationMessage(
+                    `EasyCrypt ${session.channel === 'lsp' ? 'LSP client' : 'process'} started`
+                );
                 logger?.commandComplete('easycrypt.startProcess', true, {
                     action: 'start',
-                    sessionKey: session.key
+                    sessionKey: session.key,
+                    channel: session.channel
                 });
             } catch (error) {
                 const msg = error instanceof Error ? error.message : String(error);
-                vscode.window.showErrorMessage(`EasyCrypt: Failed to start process - ${msg}`);
+                vscode.window.showErrorMessage(`EasyCrypt: Failed to start runtime - ${msg}`);
                 logger?.commandComplete('easycrypt.startProcess', false, {
                     error: msg,
-                    sessionKey: session.key
+                    sessionKey: session.key,
+                    channel: session.channel
                 });
             }
         })
@@ -456,63 +576,60 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
             const session = sessionRegistry?.getActiveSession() ?? sessionRegistry?.getAllSessions()[0];
             if (!session) {
-                vscode.window.showInformationMessage('EasyCrypt process is not running');
+                vscode.window.showInformationMessage('EasyCrypt runtime is not running');
                 logger?.commandComplete('easycrypt.stopProcess', false, { reason: 'not running' });
                 return;
             }
 
-            if (!session.processManager.isRunning()) {
-                vscode.window.showInformationMessage('EasyCrypt process is not running');
+            if (!session.isRuntimeRunning()) {
+                vscode.window.showInformationMessage('EasyCrypt runtime is not running');
                 logger?.commandComplete('easycrypt.stopProcess', false, {
                     reason: 'not running',
-                    sessionKey: session.key
+                    sessionKey: session.key,
+                    channel: session.channel
                 });
                 return;
             }
 
             await session.stop('manual-stop');
-            vscode.window.showInformationMessage('EasyCrypt process stopped');
+            vscode.window.showInformationMessage(
+                `EasyCrypt ${session.channel === 'lsp' ? 'LSP client' : 'process'} stopped`
+            );
             logger?.commandComplete('easycrypt.stopProcess', true, {
-                sessionKey: session.key
+                sessionKey: session.key,
+                channel: session.channel
             });
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt.stepForward', async () => {
-            return runRoutedStepCommand('stepForward', 'easycrypt.stepForward', async (session) => {
-                await session.ensureStarted();
-                return session.stepManager.stepForward();
+            return runRoutedStepCommand('stepForward', 'easycrypt.stepForward', async (session, token) => {
+                return session.stepForward(token);
             });
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt.stepBackward', async () => {
-            return runRoutedStepCommand('stepBackward', 'easycrypt.stepBackward', async (session) => {
-                await session.ensureStarted();
-                return session.stepManager.stepBackward();
+            return runRoutedStepCommand('stepBackward', 'easycrypt.stepBackward', async (session, token) => {
+                return session.stepBackward(token);
             });
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt.goToCursor', async () => {
-            return runRoutedStepCommand('goToCursor', 'easycrypt.goToCursor', async (session) => {
-                await session.ensureStarted();
-                return session.stepManager.goToCursor();
+            return runRoutedStepCommand('goToCursor', 'easycrypt.goToCursor', async (session, token) => {
+                return session.goToCursor(token);
             });
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt.resetProof', async () => {
-            const result = await runRoutedStepCommand('resetProof', 'easycrypt.resetProof', async (session) => {
-                session.stepManager.reset();
-                if (session.processManager.isRunning()) {
-                    await session.restart();
-                }
-                return { success: true, executionOffset: session.stepManager.getExecutionOffset() };
+            const result = await runRoutedStepCommand('resetProof', 'easycrypt.resetProof', async (session, token) => {
+                return session.resetProof(token);
             });
 
             if (result?.success) {
@@ -544,7 +661,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt._getExecutionOffset', () => {
-            return sessionRegistry?.getActiveSession()?.stepManager.getExecutionOffset() ?? 0;
+            return sessionRegistry?.getActiveSession()?.getExecutionOffset() ?? 0;
         })
     );
 
@@ -569,13 +686,13 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt._getProcessStartCount', () => {
-            return sessionRegistry?.getActiveSession()?.processManager.getProcessStartCount() ?? 0;
+            return sessionRegistry?.getActiveSession()?.getProcessStartCount() ?? 0;
         })
     );
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt._getSendCommandCount', () => {
-            return sessionRegistry?.getActiveSession()?.processManager.getSendCommandCount() ?? 0;
+            return sessionRegistry?.getActiveSession()?.getSendCommandCount() ?? 0;
         })
     );
 
@@ -606,7 +723,7 @@ function registerCommands(context: vscode.ExtensionContext): void {
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('easycrypt._simulateWebviewMessage', (message: any) => {
+        vscode.commands.registerCommand('easycrypt._simulateWebviewMessage', (message: WebviewToExtensionMessage) => {
             proofStateViewProvider?.simulateMessage(message);
             return true;
         })
@@ -637,9 +754,8 @@ function registerCommands(context: vscode.ExtensionContext): void {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('easycrypt.forceRecovery', async () => {
-            return runRoutedStepCommand('forceRecovery', 'easycrypt.forceRecovery', async (session) => {
-                await session.ensureStarted();
-                const result = await session.stepManager.forceRecovery();
+            return runRoutedStepCommand('forceRecovery', 'easycrypt.forceRecovery', async (session, token) => {
+                const result = await session.forceRecovery(token);
                 if (result.success) {
                     vscode.window.showInformationMessage('EasyCrypt: Proof state recovered successfully');
                 } else {
@@ -803,12 +919,44 @@ function registerConfigurationHandlers(context: vscode.ExtensionContext): void {
         }
 
         const config = configurationManager.getConfig();
+        const nextSignature = getCommunicationSettingsSignature(config);
+        const communicationChanged = nextSignature !== communicationSettingsSignature;
+        communicationSettingsSignature = nextSignature;
         
         // Handle diagnostics enabled/disabled
         if (!config.diagnosticsEnabled && diagnosticManager) {
             diagnosticManager.clearAll();
             log('Diagnostics disabled - cleared all diagnostics');
         }
+
+        if (communicationChanged) {
+            log('Communication settings changed; switching channel sessions');
+            logger?.event('communication-settings-changed', {
+                channel: config.communicationChannel,
+                lspServerArgs: config.lspServerArgs,
+                lspTraceServer: config.lspTraceServer,
+                lspRequestTimeoutMs: config.lspRequestTimeoutMs,
+                lspLogToFile: config.lspLogToFile
+            });
+
+            if (sessionRegistry) {
+                for (const session of sessionRegistry.getAllSessions()) {
+                    sessionCommandRouter?.cancelForSession(session.key, 'config-change');
+                }
+                await sessionRegistry.disposeAll('config-change');
+
+                const editor = getActiveEasyCryptEditor();
+                if (editor) {
+                    const session = await sessionRegistry.setActiveDocument(editor.document);
+                    await session?.syncDocumentOpen(editor.document);
+                }
+            }
+
+            if (lspClientManager) {
+                await lspClientManager.stop('config-change');
+            }
+        }
+
         log(`Configuration updated - diagnostics: ${config.diagnosticsEnabled}`);
     });
     context.subscriptions.push(configHandler);
@@ -844,6 +992,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
     // Initialize configuration manager (first, as other components depend on it)
     configurationManager = getConfigurationManager();
     context.subscriptions.push(configurationManager);
+    communicationSettingsSignature = getCommunicationSettingsSignature(configurationManager.getConfig());
 
     // Log configuration changes
     context.subscriptions.push(
@@ -851,6 +1000,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
             logger?.event('onDidChangeConfiguration', { section: 'easycrypt' });
         })
     );
+
+    lspClientManager = new LspClientManager(outputChannel, logger);
+    context.subscriptions.push(lspClientManager);
 
     // Validate executable path on startup
     await validateExecutableOnStartup();
@@ -890,10 +1042,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
     decorationProjectionService = new DecorationProjectionService(editorDecorator);
     context.subscriptions.push(decorationProjectionService);
 
-    sessionRegistry = new SessionRegistry<vscode.TextDocument, EasyCryptFileSession>({
+    sessionRegistry = new SessionRegistry<vscode.TextDocument, ManagedProofSession>({
         createSession: (document, key) => {
-            if (!configurationManager || !diagnosticManager || !decorationProjectionService || !outputChannel) {
+            if (!configurationManager || !diagnosticManager || !decorationProjectionService || !outputChannel || !lspClientManager) {
                 throw new Error('EasyCrypt: Session dependencies are not initialized');
+            }
+
+            const decision = resolvePreferredChannel(document);
+            logger?.event('session-channel-selected', {
+                sessionKey: key,
+                uri: document.uri.fsPath,
+                preferred: decision.preferred,
+                selected: decision.channel,
+                reason: decision.reason,
+                hasCompatibilityRisk: decision.hasCompatibilityRisk
+            });
+
+            if (decision.channel === 'lsp') {
+                const proofTransport = new LspProofTransport(
+                    lspClientManager,
+                    () => getLspManagerConfig(),
+                    logger
+                );
+
+                return new LspFileSession({
+                    key,
+                    documentUri: document.uri,
+                    configurationManager,
+                    diagnosticManager,
+                    decorationProjection: decorationProjectionService,
+                    proofTransport,
+                    outputChannel,
+                    logger
+                });
             }
 
             return new EasyCryptFileSession({
@@ -923,7 +1104,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
     });
     context.subscriptions.push(sessionRegistry);
 
-    sessionCommandRouter = new SessionCommandRouter<EasyCryptFileSession>(
+    sessionCommandRouter = new SessionCommandRouter<ManagedProofSession>(
         () => sessionRegistry?.getActiveSession(),
         (level, message, data) => {
             switch (level) {
@@ -1006,8 +1187,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
                 return;
             }
 
-            await sessionRegistry.setActiveDocument(editor?.document);
+            const activeSession = await sessionRegistry.setActiveDocument(editor?.document);
+            if (activeSession && editor) {
+                await activeSession.syncDocumentOpen(editor.document);
+            }
             decorationProjectionService?.projectVisibleEditors(editor?.document.uri);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidOpenTextDocument((document) => {
+            if (document.languageId !== 'easycrypt' || !sessionRegistry) {
+                return;
+            }
+
+            void (async () => {
+                const session = await sessionRegistry?.getByUri(document.uri);
+                if (session) {
+                    await session.syncDocumentOpen(document);
+                }
+            })();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeTextDocument((event) => {
+            if (event.document.languageId !== 'easycrypt' || !sessionRegistry) {
+                return;
+            }
+
+            void (async () => {
+                const session = await sessionRegistry?.getByUri(event.document.uri);
+                if (session) {
+                    await session.syncDocumentChange(event);
+                }
+            })();
         })
     );
 
@@ -1017,12 +1231,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<EasyCr
                 return;
             }
 
-            void sessionRegistry?.disposeSessionByUri(document.uri, 'file-close');
+            void (async () => {
+                const session = await sessionRegistry?.getByUri(document.uri);
+                if (session) {
+                    sessionCommandRouter?.cancelForSession(session.key, 'file-close');
+                }
+                await sessionRegistry?.disposeSessionByUri(document.uri, 'file-close');
+            })();
             decorationProjectionService?.clear(document.uri);
         })
     );
 
-    await sessionRegistry.setActiveDocument(vscode.window.activeTextEditor?.document);
+    const initialActiveEditor = vscode.window.activeTextEditor;
+    const initialSession = await sessionRegistry.setActiveDocument(initialActiveEditor?.document);
+    if (initialSession && initialActiveEditor) {
+        await initialSession.syncDocumentOpen(initialActiveEditor.document);
+    }
     decorationProjectionService.projectVisibleEditors(vscode.window.activeTextEditor?.document.uri);
 
     log('EasyCrypt extension activated successfully');
@@ -1073,8 +1297,16 @@ export async function deactivate(): Promise<void> {
     logger?.info('Extension', 'Deactivating EasyCrypt extension');
 
     if (sessionRegistry) {
+        for (const session of sessionRegistry.getAllSessions()) {
+            sessionCommandRouter?.cancelForSession(session.key, 'shutdown');
+        }
         await sessionRegistry.disposeAll('shutdown');
         sessionRegistry = undefined;
+    }
+
+    if (lspClientManager) {
+        await lspClientManager.stop('shutdown');
+        lspClientManager = undefined;
     }
 
     proofStateSubscriptionBySessionKey.forEach((disposable) => disposable.dispose());

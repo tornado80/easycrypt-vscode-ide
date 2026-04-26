@@ -8,7 +8,10 @@ EasyCrypt language support for Visual Studio Code: syntax highlighting, diagnost
 - **Diagnostics / squiggles** by running EasyCrypt and parsing its output.
   - Manual check via command.
   - Optional live checks on change/save.
-- **Interactive proof navigation** backed by a long-running EasyCrypt process:
+- **Interactive proof navigation** backed by a selectable communication channel:
+  - `emacs` channel (default): EasyCrypt `cli -emacs` process.
+  - `lsp` channel: EasyCrypt LSP server with custom proof/query requests.
+  - `auto` channel: compatibility-based selection.
   - Step forward/backward through statements.
   - Jump to cursor.
   - Reset proof state.
@@ -33,8 +36,8 @@ EasyCrypt language support for Visual Studio Code: syntax highlighting, diagnost
 From the Command Palette:
 
 - **EasyCrypt: Check File** (`easycrypt.checkFile`)
-- **EasyCrypt: Start/Restart Process** (`easycrypt.startProcess`)
-- **EasyCrypt: Stop Process** (`easycrypt.stopProcess`)
+- **EasyCrypt: Start/Restart Process** (`easycrypt.startProcess`) - starts/restarts current runtime (process or LSP client)
+- **EasyCrypt: Stop Process** (`easycrypt.stopProcess`) - stops current runtime (process or LSP client)
 - **EasyCrypt: Clear All Diagnostics** (`easycrypt.clearAllDiagnostics`)
 - **EasyCrypt: Clear File Diagnostics** (`easycrypt.clearFileDiagnostics`)
 - **EasyCrypt: Show Diagnostic Count** (`easycrypt.showDiagnosticCount`)
@@ -75,6 +78,17 @@ Settings (see VS Code Settings UI under “EasyCrypt”):
 - `easycrypt.arguments`: additional CLI args passed to EasyCrypt on startup
 - `easycrypt.proverArgs`: args for backend provers (passed through EasyCrypt)
 
+Communication channels:
+
+- `easycrypt.communication.channel`: `emacs` | `lsp` | `auto` (default: `emacs`)
+
+LSP options:
+
+- `easycrypt.lsp.serverArgs`: additional args for `easycrypt lsp`
+- `easycrypt.lsp.trace.server`: `off` | `messages` | `verbose`
+- `easycrypt.lsp.requestTimeoutMs`: timeout for proof/query requests
+- `easycrypt.lsp.logToFile`: sets `EASYCRYPT_LSP_LOG=1` for server logging
+
 Diagnostics:
 
 - `easycrypt.diagnostics.enabled`: enable/disable diagnostics
@@ -87,6 +101,13 @@ Logging / debug:
 
 - `easycrypt.verboseLogging`: enable verbose logging to the “EasyCrypt” Output channel
 - `easycrypt.proofStateView.debug.showEmacsPromptMarker`: show the EasyCrypt `-emacs` prompt marker in the Proof State view
+
+## Channel Notes
+
+- `emacs` remains the baseline/default for maximum context parity.
+- `lsp` is supported for interactive proof commands and queries through custom RPC methods.
+- `auto` prefers LSP only when context is compatible; otherwise it selects emacs.
+- For context-sensitive setups (custom include/prover args), emacs is usually the safest choice.
 
 ## Troubleshooting
 
