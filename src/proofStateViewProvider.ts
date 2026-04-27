@@ -31,6 +31,15 @@ export interface SerializedProofProgress {
 }
 
 /**
+ * Optional layout hints for proof state rendering in the webview.
+ */
+export interface SerializedProofLayoutHints {
+    minScale?: number;
+    maxScale?: number;
+    defaultUserScale?: number;
+}
+
+/**
  * Serialized proof state for the webview boundary
  */
 export interface SerializedProofState {
@@ -44,6 +53,8 @@ export interface SerializedProofState {
     progress?: SerializedProofProgress;
     /** Debug-only emacs prompt marker (only included when setting is enabled) */
     debugEmacsPromptMarker?: string;
+    /** Optional layout defaults for adaptive fit/scroll behavior */
+    layoutHints?: SerializedProofLayoutHints;
 }
 
 /**
@@ -86,6 +97,13 @@ export type ExtensionToWebviewMessage = { type: 'updateState'; state: Serialized
  * ```
  */
 export class ProofStateViewProvider implements vscode.WebviewViewProvider {
+    /** Default layout hints for webview adaptive fit + sticky zoom behavior */
+    private static readonly DEFAULT_LAYOUT_HINTS: SerializedProofLayoutHints = {
+        minScale: 0.65,
+        maxScale: 2.5,
+        defaultUserScale: 1
+    };
+
     /** The webview view instance */
     private _view?: vscode.WebviewView;
 
@@ -226,7 +244,8 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
             outputLines: state.outputLines,
             messages: state.messages.map(m => ({ severity: m.severity, content: m.content })),
             progress: state.progress,
-            debugEmacsPromptMarker: state.debugEmacsPromptMarker
+            debugEmacsPromptMarker: state.debugEmacsPromptMarker,
+            layoutHints: state.layoutHints
         });
     }
 
@@ -272,7 +291,8 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
             outputLines: state.outputLines ?? [],
             progress: state.progress,
             // Only include prompt marker when enabled
-            debugEmacsPromptMarker: includePromptMarker ? state.debugEmacsPromptMarker : undefined
+            debugEmacsPromptMarker: includePromptMarker ? state.debugEmacsPromptMarker : undefined,
+            layoutHints: ProofStateViewProvider.DEFAULT_LAYOUT_HINTS
         };
     }
 

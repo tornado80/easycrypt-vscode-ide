@@ -7,7 +7,7 @@
 :root {
     --container-padding: 12px;
     --border-radius: 4px;
-    --proof-fit-scale: 1;
+    --proof-effective-scale: 1;
 }
 
 * {
@@ -43,37 +43,56 @@ body {
 .state-viewport {
     flex: 1 1 auto;
     min-height: 0;
-    overflow: hidden;
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-gutter: stable;
 }
 
 .state-layout {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    width: calc(100% / var(--proof-fit-scale));
-    transform: scale(var(--proof-fit-scale));
-    transform-origin: top left;
+    min-width: 0;
+    font-size: calc(var(--vscode-font-size, 13px) * var(--proof-effective-scale));
+    line-height: 1.45;
 }
 
-.state-layout.is-scaled {
+.state-layout.is-scaled-down {
     line-height: 1.3;
 }
 
 /* Navigation Toolbar */
 .nav-toolbar {
     display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
     padding: 6px 0;
     border-bottom: 1px solid var(--vscode-panel-border);
 }
 
-.nav-button {
+.nav-toolbar-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+}
+
+.nav-toolbar-nav {
     flex: 1 1 auto;
-    min-width: 60px;
-    padding: 4px 8px;
+    flex-wrap: wrap;
+}
+
+.nav-toolbar-zoom {
+    flex: 0 0 auto;
+    margin-left: auto;
+}
+
+.nav-button {
+    min-width: 4.4em;
+    padding: 0.35em 0.75em;
     font-family: var(--vscode-font-family);
-    font-size: 11px;
+    font-size: 0.82em;
     font-weight: 500;
     color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
     background-color: var(--vscode-button-secondaryBackground, var(--vscode-editor-background));
@@ -83,6 +102,28 @@ body {
     transition: background-color 0.1s ease;
     white-space: nowrap;
     text-align: center;
+}
+
+.nav-toolbar-nav .nav-button {
+    flex: 1 1 auto;
+    min-width: 5.9em;
+}
+
+.zoom-button {
+    flex: 0 0 auto;
+    min-width: 2.3em;
+}
+
+.zoom-reset-button {
+    min-width: 4.9em;
+}
+
+.zoom-label {
+    min-width: 3.8em;
+    text-align: right;
+    font-size: 0.82em;
+    color: var(--vscode-descriptionForeground);
+    user-select: none;
 }
 
 .nav-button:hover:not(:disabled) {
@@ -120,7 +161,7 @@ body {
 
 .section-title {
     font-weight: 600;
-    font-size: 11px;
+    font-size: 0.82em;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--vscode-sideBarSectionHeader-foreground);
@@ -131,7 +172,7 @@ body {
     color: var(--vscode-badge-foreground);
     padding: 2px 6px;
     border-radius: 10px;
-    font-size: 10px;
+    font-size: 0.75em;
     font-weight: 600;
 }
 
@@ -153,7 +194,7 @@ body {
 }
 
 .goal-title {
-    font-size: 12px;
+    font-size: 0.9em;
     font-weight: 600;
     color: var(--vscode-sideBarSectionHeader-foreground);
 }
@@ -170,7 +211,7 @@ body {
     cursor: pointer;
     padding: 2px 6px;
     border-radius: 3px;
-    font-size: 11px;
+    font-size: 0.82em;
     opacity: 0.7;
 }
 
@@ -182,7 +223,7 @@ body {
 .hypotheses {
     padding: 10px;
     font-family: var(--vscode-editor-font-family), monospace;
-    font-size: var(--vscode-editor-font-size, 13px);
+    font-size: 0.95em;
     white-space: pre-wrap;
     word-break: break-word;
 }
@@ -201,7 +242,7 @@ body {
 .conclusion {
     padding: 10px;
     font-family: var(--vscode-editor-font-family), monospace;
-    font-size: var(--vscode-editor-font-size, 13px);
+    font-size: 0.95em;
     white-space: pre-wrap;
     word-break: break-word;
     color: var(--vscode-symbolIcon-functionForeground, var(--vscode-foreground));
@@ -216,7 +257,7 @@ body {
     padding: 8px 10px;
     margin-bottom: 6px;
     border-radius: var(--border-radius);
-    font-size: 12px;
+    font-size: 0.9em;
     display: flex;
     align-items: flex-start;
     gap: 8px;
@@ -224,7 +265,7 @@ body {
 
 .message-icon {
     flex-shrink: 0;
-    font-size: 14px;
+    font-size: 1.05em;
 }
 
 .message-content {
@@ -254,7 +295,7 @@ body {
 }
 
 .empty-state-text {
-    font-size: 13px;
+    font-size: 1em;
 }
 
 .processing {
@@ -284,7 +325,7 @@ body {
 .output-lines {
     padding: 10px;
     font-family: var(--vscode-editor-font-family), monospace;
-    font-size: var(--vscode-editor-font-size, 13px);
+    font-size: 0.95em;
     white-space: pre-wrap;
     word-break: break-word;
     background-color: var(--vscode-editor-background);
@@ -306,7 +347,7 @@ body {
     display: flex;
     align-items: baseline;
     padding: 3px 0;
-    font-size: 12px;
+    font-size: 0.9em;
 }
 
 .progress-label {
@@ -326,7 +367,7 @@ body {
 
 .progress-line.last-statement .last-statement-text {
     font-family: var(--vscode-editor-font-family), monospace;
-    font-size: 11px;
+    font-size: 0.85em;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -335,7 +376,22 @@ body {
 
 .progress-line.prompt-marker .prompt-value {
     font-family: var(--vscode-editor-font-family), monospace;
-    font-size: 11px;
+    font-size: 0.85em;
     color: var(--vscode-debugTokenExpression-string, var(--vscode-foreground));
     opacity: 0.8;
+}
+
+@media (max-width: 380px) {
+    .nav-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .nav-toolbar-zoom {
+        margin-left: 0;
+    }
+
+    .zoom-label {
+        min-width: 3.2em;
+    }
 }

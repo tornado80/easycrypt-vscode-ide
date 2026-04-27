@@ -12,8 +12,11 @@
     // @ts-ignore - acquireVsCodeApi is provided by VS Code webview
     const vscode = acquireVsCodeApi();
 
-    /** @type {HTMLElement} */
+    /** @type {HTMLElement|null} */
     const app = document.getElementById('app');
+    if (!app) {
+        return;
+    }
 
     /**
      * @typedef {Object} ProofGoal
@@ -35,6 +38,13 @@
      */
 
     /**
+     * @typedef {Object} ProofLayoutHints
+     * @property {number} [minScale]
+     * @property {number} [maxScale]
+     * @property {number} [defaultUserScale]
+     */
+
+    /**
      * @typedef {Object} SerializedProofState
      * @property {ProofGoal[]} goals
      * @property {ProofMessage[]} messages
@@ -43,6 +53,7 @@
      * @property {string[]} outputLines
      * @property {ProofProgress} [progress]
      * @property {string} [debugEmacsPromptMarker]
+    * @property {ProofLayoutHints} [layoutHints]
      */
 
     /**
@@ -68,16 +79,52 @@
         isComplete: false,
         outputLines: [],
         progress: undefined,
-        debugEmacsPromptMarker: undefined
+        debugEmacsPromptMarker: undefined,
+        layoutHints: undefined
     };
 
-    const MIN_LAYOUT_SCALE = 0.4;
-    const SCALE_EPSILON = 0.01;
+    const DEFAULT_MIN_SCALE = 0.65;
+    const DEFAULT_MAX_SCALE = 2.5;
+    const DEFAULT_USER_SCALE = 1;
+    const PERSISTED_USER_SCALE_KEY = 'proofStateUserScale';
+    const BUTTON_ZOOM_FACTOR = 1.1;
+    const WHEEL_ZOOM_SENSITIVITY = 0.0012;
+    const SCALE_EPSILON = 0.0001;
+
+    /**
+     * @typedef {Object} ProofViewLayoutState
+     * @property {number} autoFitScale
+     * @property {number} userScale
+     * @property {number} effectiveScale
+     * @property {number} minScale
+     * @property {number} maxScale
+     */
+
+    /** @type {ProofViewLayoutState} */
+    const layoutState = {
+        autoFitScale: 1,
+        userScale: DEFAULT_USER_SCALE,
+        effectiveScale: 1,
+        minScale: DEFAULT_MIN_SCALE,
+        maxScale: DEFAULT_MAX_SCALE
+    };
+
+    let hasUserAdjustedScale = false;
 
     /** @type {number|undefined} */
     let pendingFitFrame;
     /** @type {HTMLElement|null} */
     let lastFitTarget = null;
+    /** @type {ResizeObserver|undefined} */
+    let resizeObserver;
+    /** @type {HTMLElement|null} */
+    let observedLayout = null;
+    /** @type {HTMLElement|null} */
+    let observedViewport = null;
+    /** @type {HTMLElement|null} */
+    let zoomLabelElement = null;
+
+    initializeUserScale();
 
     /**
      * Creates a text node safely (no HTML interpretation)
@@ -117,36 +164,288 @@
     }
 
     /**
-     * Scales state content to fit the available viewport height.
-     * Keeps the view static (no internal scrollbars) while stepping.
-     * @param {HTMLElement|null} target
+     * @param {unknown} value
+     * @param {number} fallback
+     * @returns {number}
      */
+    function toFiniteNumber(value, fallback) {
+        return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+    }
+
+    /**
+     * @param {number} minScale
+     * @param {number} maxScale
+     * @returns {{ minScale: number, maxScale: number }}
+     */
+    function normalizeScaleBounds(minScale, maxScale) {
+        const safeMin = clamp(toFiniteNumber(minScale, DEFAULT_MIN_SCALE), 0.1, 10);
+        const safeMax = clamp(toFiniteNumber(maxScale, DEFAULT_MAX_SCALE), safeMin, 10);
+        return { minScale: safeMin, maxScale: safeMax };
+    }
+
+    /**
+     * @returns {number}
+     */
+    function readPersistedUserScale() {
+        const persisted = vscode.getState();
+        if (!persisted || typeof persisted !== 'object') {
+            return DEFAULT_USER_SCALE;
+        }
+
+        const rawUserScale = persisted[PERSISTED_USER_SCALE_KEY];
+        return toFiniteNumber(rawUserScale, DEFAULT_USER_SCALE);
+    }
+
+    function initializeUserScale() {
+        const restoredScale = readPersistedUserScale();
+        const bounds = normalizeScaleBounds(layoutState.minScale, layoutState.maxScale);
+        layoutState.minScale = bounds.minScale;
+        layoutState.maxScale = bounds.maxScale;
+        layoutState.userScale = clamp(restoredScale, layoutState.minScale, layoutState.maxScale);
+        hasUserAdjustedScale = Math.abs(layoutState.userScale - DEFAULT_USER_SCALE) > SCALE_EPSILON;
+        layoutState.effectiveScale = computeEffectiveScale(
+            layoutState.autoFitScale,
+            layoutState.userScale,
+            layoutState.minScale,
+            layoutState.maxScale
+        );
+    }
+
+    function persistUserScale() {
+        const persisted = vscode.getState();
+        const persistedObject = persisted && typeof persisted === 'object' ? persisted : {};
+        vscode.setState({
+            ...persistedObject,
+            [PERSISTED_USER_SCALE_KEY]: layoutState.userScale
+        });
+    }
+
+    /**
+     * @param {ProofLayoutHints|undefined} layoutHints
+     */
+    function applyLayoutHints(layoutHints) {
+        const bounds = normalizeScaleBounds(
+            toFiniteNumber(layoutHints?.minScale, DEFAULT_MIN_SCALE),
+            toFiniteNumber(layoutHints?.maxScale, DEFAULT_MAX_SCALE)
+        );
+
+        layoutState.minScale = bounds.minScale;
+        layoutState.maxScale = bounds.maxScale;
+
+        if (!hasUserAdjustedScale) {
+            const hintedDefault = toFiniteNumber(layoutHints?.defaultUserScale, DEFAULT_USER_SCALE);
+            layoutState.userScale = clamp(hintedDefault, layoutState.minScale, layoutState.maxScale);
+        } else {
+            layoutState.userScale = clamp(layoutState.userScale, layoutState.minScale, layoutState.maxScale);
+        }
+    }
+
+    /**
+     * @typedef {Object} LayoutComputationInput
+     * @property {number} viewportHeight
+     * @property {number} contentNaturalHeight
+     * @property {number} minScale
+     * @property {number} maxScale
+     */
+
+    /**
+     * @param {LayoutComputationInput} input
+     * @returns {number}
+     */
+    function computeAutoFitScale(input) {
+        const minScale = toFiniteNumber(input?.minScale, DEFAULT_MIN_SCALE);
+        const maxScale = toFiniteNumber(input?.maxScale, DEFAULT_MAX_SCALE);
+        const bounds = normalizeScaleBounds(minScale, maxScale);
+
+        const viewportHeight = toFiniteNumber(input?.viewportHeight, 0);
+        const contentNaturalHeight = toFiniteNumber(input?.contentNaturalHeight, 0);
+
+        if (viewportHeight <= 0 || contentNaturalHeight <= 0) {
+            return clamp(1, bounds.minScale, bounds.maxScale);
+        }
+
+        const rawFitScale = Math.min(1, viewportHeight / contentNaturalHeight);
+        return clamp(rawFitScale, bounds.minScale, bounds.maxScale);
+    }
+
+    /**
+     * @param {number} autoFitScale
+     * @param {number} userScale
+     * @param {number} minScale
+     * @param {number} maxScale
+     * @returns {number}
+     */
+    function computeEffectiveScale(autoFitScale, userScale, minScale, maxScale) {
+        const safeAutoFitScale = toFiniteNumber(autoFitScale, 1);
+        const safeUserScale = toFiniteNumber(userScale, DEFAULT_USER_SCALE);
+        const bounds = normalizeScaleBounds(minScale, maxScale);
+        return clamp(safeAutoFitScale * safeUserScale, bounds.minScale, bounds.maxScale);
+    }
+
+    function updateZoomLabel() {
+        if (!zoomLabelElement) {
+            return;
+        }
+
+        const zoomPercent = Math.round(layoutState.effectiveScale * 100);
+        zoomLabelElement.textContent = `${zoomPercent}%`;
+        zoomLabelElement.title = `Zoom ${zoomPercent}%`;
+    }
+
+    /**
+     * @returns {{absolute: number, relative: number}|undefined}
+     */
+    function captureViewportScrollSnapshot() {
+        const existingViewport = app.querySelector('.state-viewport');
+        if (!(existingViewport instanceof HTMLElement)) {
+            return undefined;
+        }
+
+        const maxScrollTop = Math.max(0, existingViewport.scrollHeight - existingViewport.clientHeight);
+        const relative = maxScrollTop > 0 ? existingViewport.scrollTop / maxScrollTop : 0;
+
+        return {
+            absolute: existingViewport.scrollTop,
+            relative
+        };
+    }
+
+    /**
+     * @param {HTMLElement} viewport
+     * @param {{absolute: number, relative: number}|undefined} snapshot
+     */
+    function restoreViewportScroll(viewport, snapshot) {
+        if (!snapshot) {
+            return;
+        }
+
+        requestAnimationFrame(() => {
+            const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+            if (maxScrollTop <= 0) {
+                viewport.scrollTop = 0;
+                return;
+            }
+
+            const relativeTarget = snapshot.relative * maxScrollTop;
+            const absoluteTarget = Math.min(snapshot.absolute, maxScrollTop);
+            viewport.scrollTop = Math.max(0, Math.min(maxScrollTop, Math.max(relativeTarget, absoluteTarget)));
+        });
+    }
+
     function applyLayoutFit(target) {
         if (!target) {
             return;
         }
 
         const viewport = target.parentElement;
-        if (!viewport) {
+        if (!(viewport instanceof HTMLElement)) {
             return;
         }
 
-        target.style.setProperty('--proof-fit-scale', '1');
-        target.classList.remove('is-scaled');
+        target.style.setProperty('--proof-effective-scale', '1');
 
-        const availableHeight = viewport.clientHeight;
         const naturalHeight = target.scrollHeight;
+        const viewportHeight = viewport.clientHeight;
 
-        if (availableHeight <= 0 || naturalHeight <= 0) {
+        layoutState.autoFitScale = computeAutoFitScale({
+            viewportHeight,
+            contentNaturalHeight: naturalHeight,
+            minScale: layoutState.minScale,
+            maxScale: layoutState.maxScale
+        });
+
+        layoutState.effectiveScale = computeEffectiveScale(
+            layoutState.autoFitScale,
+            layoutState.userScale,
+            layoutState.minScale,
+            layoutState.maxScale
+        );
+
+        target.style.setProperty('--proof-effective-scale', String(layoutState.effectiveScale));
+        target.classList.toggle('is-scaled-down', layoutState.effectiveScale < 1 - SCALE_EPSILON);
+        updateZoomLabel();
+    }
+
+    /**
+     * @param {number} nextUserScale
+     */
+    function setUserScale(nextUserScale) {
+        const clampedScale = clamp(
+            toFiniteNumber(nextUserScale, DEFAULT_USER_SCALE),
+            layoutState.minScale,
+            layoutState.maxScale
+        );
+
+        if (Math.abs(clampedScale - layoutState.userScale) < SCALE_EPSILON) {
             return;
         }
 
-        const nextScale = naturalHeight > availableHeight
-            ? clamp(availableHeight / naturalHeight, MIN_LAYOUT_SCALE, 1)
-            : 1;
+        layoutState.userScale = clampedScale;
+        hasUserAdjustedScale = true;
+        persistUserScale();
+        scheduleLayoutFit(lastFitTarget);
+    }
 
-        target.style.setProperty('--proof-fit-scale', String(nextScale));
-        target.classList.toggle('is-scaled', nextScale < 1 - SCALE_EPSILON);
+    /**
+     * @param {number} factor
+     */
+    function adjustUserScaleByFactor(factor) {
+        const safeFactor = toFiniteNumber(factor, 1);
+        if (safeFactor <= 0) {
+            return;
+        }
+
+        setUserScale(layoutState.userScale * safeFactor);
+    }
+
+    function resetUserScale() {
+        setUserScale(DEFAULT_USER_SCALE);
+    }
+
+    /**
+     * @param {HTMLElement|null} target
+     */
+    function updateLayoutObservers(target) {
+        const viewport = target?.parentElement;
+        const isSameTarget = target === observedLayout;
+        const isSameViewport = viewport === observedViewport;
+
+        if (isSameTarget && isSameViewport) {
+            return;
+        }
+
+        if (resizeObserver) {
+            resizeObserver.disconnect();
+            resizeObserver = undefined;
+        }
+
+        observedLayout = target;
+        observedViewport = viewport instanceof HTMLElement ? viewport : null;
+
+        if (typeof ResizeObserver === 'undefined' || !target || !observedViewport) {
+            return;
+        }
+
+        resizeObserver = new ResizeObserver(() => {
+            scheduleLayoutFit(lastFitTarget);
+        });
+        resizeObserver.observe(target);
+        resizeObserver.observe(observedViewport);
+    }
+
+    function disposeLayoutScheduling() {
+        if (pendingFitFrame !== undefined) {
+            cancelAnimationFrame(pendingFitFrame);
+            pendingFitFrame = undefined;
+        }
+
+        if (resizeObserver) {
+            resizeObserver.disconnect();
+            resizeObserver = undefined;
+        }
+
+        observedLayout = null;
+        observedViewport = null;
     }
 
     /**
@@ -155,6 +454,7 @@
      */
     function scheduleLayoutFit(target) {
         if (!target) {
+            updateZoomLabel();
             return;
         }
 
@@ -199,6 +499,7 @@
     function renderToolbar() {
         const toolbar = createElement('div', 'nav-toolbar');
         const buttonState = computeNavButtonState();
+        const navGroup = createElement('div', 'nav-toolbar-group nav-toolbar-nav');
 
         for (const btnConfig of NAV_BUTTONS) {
             const button = createElement('button', 'nav-button', btnConfig.label);
@@ -223,8 +524,42 @@
                 }
             });
 
-            toolbar.appendChild(button);
+            navGroup.appendChild(button);
         }
+
+        const zoomGroup = createElement('div', 'nav-toolbar-group nav-toolbar-zoom');
+
+        const zoomOutButton = createElement('button', 'nav-button zoom-button', '−');
+        zoomOutButton.title = 'Zoom Out';
+        zoomOutButton.setAttribute('aria-label', 'Zoom Out');
+        zoomOutButton.addEventListener('click', () => {
+            adjustUserScaleByFactor(1 / BUTTON_ZOOM_FACTOR);
+        });
+
+        const zoomInButton = createElement('button', 'nav-button zoom-button', '+');
+        zoomInButton.title = 'Zoom In';
+        zoomInButton.setAttribute('aria-label', 'Zoom In');
+        zoomInButton.addEventListener('click', () => {
+            adjustUserScaleByFactor(BUTTON_ZOOM_FACTOR);
+        });
+
+        const resetZoomButton = createElement('button', 'nav-button zoom-button zoom-reset-button', 'Reset');
+        resetZoomButton.title = 'Reset Zoom';
+        resetZoomButton.setAttribute('aria-label', 'Reset Zoom');
+        resetZoomButton.addEventListener('click', () => {
+            resetUserScale();
+        });
+
+        zoomLabelElement = createElement('span', 'zoom-label');
+
+        zoomGroup.appendChild(zoomOutButton);
+        zoomGroup.appendChild(zoomInButton);
+        zoomGroup.appendChild(resetZoomButton);
+        zoomGroup.appendChild(zoomLabelElement);
+
+        toolbar.appendChild(navGroup);
+        toolbar.appendChild(zoomGroup);
+        updateZoomLabel();
 
         return toolbar;
     }
@@ -381,6 +716,8 @@
      * Main render function - rebuilds the entire view
      */
     function render() {
+        const previousScrollSnapshot = captureViewportScrollSnapshot();
+
         // Clear existing content
         while (app.firstChild) {
             app.removeChild(app.firstChild);
@@ -394,7 +731,11 @@
 
         // Processing state
         if (state.isProcessing) {
+            lastFitTarget = null;
+            updateLayoutObservers(null);
             viewport.appendChild(renderProcessing());
+            restoreViewportScroll(viewport, previousScrollSnapshot);
+            updateZoomLabel();
             return;
         }
 
@@ -419,7 +760,9 @@
         }
 
         viewport.appendChild(layout);
+        updateLayoutObservers(layout);
         scheduleLayoutFit(layout);
+        restoreViewportScroll(viewport, previousScrollSnapshot);
     }
 
     /**
@@ -430,17 +773,50 @@
         const message = event.data;
         if (message && message.type === 'updateState') {
             state = message.state;
+            applyLayoutHints(state.layoutHints);
             render();
         }
+    }
+
+    /**
+     * @param {UIEvent} event
+     */
+    function handleZoomWheel(event) {
+        const wheelEvent = /** @type {WheelEvent} */ (event);
+        if (!(wheelEvent.ctrlKey || wheelEvent.metaKey)) {
+            return;
+        }
+
+        const targetNode = wheelEvent.target;
+        if (!(targetNode instanceof Node) || !app.contains(targetNode)) {
+            return;
+        }
+
+        wheelEvent.preventDefault();
+        const factor = Math.exp(-wheelEvent.deltaY * WHEEL_ZOOM_SENSITIVITY);
+        adjustUserScaleByFactor(factor);
+    }
+
+    function handleResize() {
+        scheduleLayoutFit(lastFitTarget);
+    }
+
+    function dispose() {
+        window.removeEventListener('message', handleMessage);
+        window.removeEventListener('resize', handleResize);
+        window.removeEventListener('wheel', handleZoomWheel);
+        disposeLayoutScheduling();
     }
 
     // Listen for messages from the extension
     window.addEventListener('message', handleMessage);
 
     // Re-fit when the view is resized by the workbench layout
-    window.addEventListener('resize', () => {
-        scheduleLayoutFit(lastFitTarget);
-    });
+    window.addEventListener('resize', handleResize);
+
+    // Pinch/spread-like wheel gestures for zoom support.
+    window.addEventListener('wheel', handleZoomWheel, { passive: false });
+    window.addEventListener('unload', dispose, { once: true });
 
     // Initial render
     render();
