@@ -78,6 +78,10 @@ export type WebviewToExtensionMessage =
  */
 export type ExtensionToWebviewMessage = { type: 'updateState'; state: SerializedProofState };
 
+interface UpdateViewOptions {
+    forcePost?: boolean;
+}
+
 /**
  * Provides a Webview-based view for displaying proof state.
  * 
@@ -160,6 +164,7 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
         _token: vscode.CancellationToken
     ): void | Thenable<void> {
         this._view = webviewView;
+        this.lastPostedStateHash = undefined;
 
         // Configure webview options - restrict to media folder only
         webviewView.webview.options = {
@@ -188,20 +193,27 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
     /**
      * Updates the webview with new proof state
      */
-    private updateView(state: ProofState): void {
+    private updateView(state: ProofState, options?: UpdateViewOptions): void {
         if (this._view) {
+            const forcePost = options?.forcePost ?? false;
+
             // UI suppression:
             // - When processing starts: send exactly one update (spinner).
             // - While processing: suppress intermediate updates.
             // - When processing ends: send exactly one update (final state).
-            if (state.isProcessing) {
-                if (this.inProcessingWindow) {
-                    return;
+            if (!forcePost) {
+                if (state.isProcessing) {
+                    if (this.inProcessingWindow) {
+                        return;
+                    }
+                    this.inProcessingWindow = true;
+                } else if (this.inProcessingWindow) {
+                    // First non-processing state after a processing window: deliver it.
+                    this.inProcessingWindow = false;
                 }
-                this.inProcessingWindow = true;
-            } else if (this.inProcessingWindow) {
-                // First non-processing state after a processing window: deliver it.
-                this.inProcessingWindow = false;
+            } else {
+                // Keep processing-window bookkeeping aligned with the forced replayed state.
+                this.inProcessingWindow = state.isProcessing;
             }
 
             const serialized = this.serializeState(state);
@@ -210,7 +222,7 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
             // Skip posting if the serialized state is identical to the last posted state.
             // This prevents repeated "final" updates when late chunks trigger the same state.
             const stateHash = this.computeStateHash(serialized);
-            if (stateHash === this.lastPostedStateHash) {
+            if (!forcePost && stateHash === this.lastPostedStateHash) {
                 return;
             }
             this.lastPostedStateHash = stateHash;
@@ -312,8 +324,8 @@ export class ProofStateViewProvider implements vscode.WebviewViewProvider {
     private handleWebviewMessage(message: WebviewToExtensionMessage): void {
         switch (message.type) {
             case 'ready':
-                // Webview is ready, send current state
-                this.updateView(this.currentState);
+                // Webview is ready, force replay of the latest state even if unchanged.
+                this.updateView(this.currentState, { forcePost: true });
                 break;
             case 'nav':
                 this.handleNavigationAction(message.action);

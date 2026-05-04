@@ -27,14 +27,23 @@
     "cryptography"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "easycrypt",
+          "title": "EasyCrypt",
+          "icon": "assets/activitybar-icon.svg"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "easycrypt": [
         {
           "type": "webview",
           "id": "easycrypt.proofStateView",
-          "name": "Proof State",
+          "name": "EasyCrypt",
           "icon": "assets/icon.png",
-          "contextualTitle": "EasyCrypt Proof State"
+          "contextualTitle": "EasyCrypt"
         }
       ]
     },

@@ -46,6 +46,32 @@ async function waitForExecutionOffset(predicate, timeoutMs = 10_000) {
   return vscode.commands.executeCommand('easycrypt._getExecutionOffset');
 }
 
+async function waitForProofStateViewSettled(timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastCount;
+  let stableReadCount = 0;
+
+  while (Date.now() < deadline) {
+    const snapshot = await vscode.commands.executeCommand('easycrypt._getProofStateSnapshot');
+    const viewUpdateCount = await vscode.commands.executeCommand('easycrypt._getProofStateViewUpdateCount');
+    const isIdle = !!snapshot && snapshot.isProcessing === false;
+
+    if (isIdle && lastCount === viewUpdateCount) {
+      stableReadCount += 1;
+      if (stableReadCount >= 2) {
+        return viewUpdateCount;
+      }
+    } else {
+      stableReadCount = 0;
+      lastCount = viewUpdateCount;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  return vscode.commands.executeCommand('easycrypt._getProofStateViewUpdateCount');
+}
+
 describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
   this.timeout(60_000);
 
@@ -535,6 +561,56 @@ describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
         assert.ok(
           viewUpdates <= 2,
           `Expected <= 2 proof state view updates during batch goToCursor, got ${viewUpdates}`
+        );
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('replays latest proof state on webview ready without extra navigation', async function () {
+      const { path: filePath, cleanup } = await createTempEcFile(
+        [
+          'require import A.',
+          'lemma t : true.',
+          'proof.',
+          '  trivial.',
+          'qed.',
+          '',
+        ].join('\n'),
+        'proof_state_ready_replay.ec'
+      );
+
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+        await vscode.languages.setTextDocumentLanguage(doc, 'easycrypt');
+        await vscode.window.showTextDocument(doc);
+
+        // Ensure the proof state webview exists.
+        await vscode.commands.executeCommand('easycrypt.proofStateView.focus');
+
+        // Establish a non-empty proof state once.
+        const step = await vscode.commands.executeCommand('easycrypt.stepForward');
+        assert.ok(step && step.success, `Expected stepForward success, got: ${JSON.stringify(step)}`);
+
+        const beforeReadyReplay = await waitForProofStateViewSettled();
+        assert.ok(
+          typeof beforeReadyReplay === 'number',
+          `Expected numeric view update count before ready replay, got: ${beforeReadyReplay}`
+        );
+
+        // Simulate a webview re-render handshake.
+        await vscode.commands.executeCommand('easycrypt._simulateWebviewMessage', { type: 'ready' });
+
+        const afterReadyReplay = await waitForProofStateViewSettled();
+        assert.ok(
+          typeof afterReadyReplay === 'number',
+          `Expected numeric view update count after ready replay, got: ${afterReadyReplay}`
+        );
+
+        // The latest state must be re-posted to the webview even when unchanged.
+        assert.ok(
+          afterReadyReplay > beforeReadyReplay,
+          `Expected ready replay to post at least one update (before=${beforeReadyReplay}, after=${afterReadyReplay})`
         );
       } finally {
         await cleanup();
