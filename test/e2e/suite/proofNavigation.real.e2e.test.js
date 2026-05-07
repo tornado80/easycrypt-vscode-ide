@@ -1,4 +1,6 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
@@ -56,10 +58,37 @@ async function waitForNoErrorDiagnostics(uri, timeoutMs = 20_000) {
   return getErrorDiagnostics(uri);
 }
 
+async function createRealKemDemFixtureCopy(mutateSource) {
+  const srcDir = path.resolve(__dirname, '..', '..', 'kem-dem', 'left-or-right');
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'easycrypt-proofnav-real-kemdem-'));
+  const dstDir = path.join(tmpDir, 'left-or-right');
+  await fs.cp(srcDir, dstDir, { recursive: true });
+
+  const filePath = path.join(dstDir, 'KEMDEM_lor.ec');
+  let source = await fs.readFile(filePath, 'utf8');
+  if (typeof mutateSource === 'function') {
+    source = mutateSource(source);
+    await fs.writeFile(filePath, source, 'utf8');
+  }
+
+  return {
+    filePath,
+    source,
+    cleanup: async () => {
+      try {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+  };
+}
+
 describe('Interactive Proof Navigation E2E (real easycrypt)', function () {
   this.timeout(240_000);
 
   const optInPrgRecoveryEasycryptPath = process.env.EASYCRYPT_REAL_PATH;
+  const optInStopOnFirstError = process.env.EASYCRYPT_REAL_STOP_ON_FIRST_ERROR;
 
   if (optInPrgRecoveryEasycryptPath) {
     it('PRG.ec goToCursor then stepBackward preserves final tail output in proof state snapshot', async function () {
@@ -121,6 +150,74 @@ describe('Interactive Proof Navigation E2E (real easycrypt)', function () {
         );
       } finally {
         await vscode.commands.executeCommand('easycrypt.stopProcess');
+      }
+    });
+  }
+
+  if (optInStopOnFirstError) {
+    it('KEMDEM_lor.ec goToCursor stops on first failing statement and runtime remains usable', async function () {
+      const easycryptPath = await resolveEasycryptPath();
+      if (!easycryptPath) {
+        this.skip();
+        return;
+      }
+
+      await configureRealEasyCrypt(easycryptPath);
+
+      const ext = vscode.extensions.getExtension('tornado.easycrypt-vscode');
+      assert.ok(ext, 'Extension tornado.easycrypt-vscode should be present');
+      await ext.activate();
+
+      const mutateSource = (source) => {
+        const needle = '  by sim.';
+        const index = source.indexOf(needle);
+        assert.ok(index >= 0, 'Expected a stable by sim. line in KEMDEM_lor.ec');
+        return source.slice(0, index) + '  by this_is_not_a_tactic.' + source.slice(index + needle.length);
+      };
+
+      const { filePath, source, cleanup } = await createRealKemDemFixtureCopy(mutateSource);
+
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+        await vscode.languages.setTextDocumentLanguage(doc, 'easycrypt');
+        const editor = await vscode.window.showTextDocument(doc);
+
+        const failLine = source.slice(0, source.indexOf('this_is_not_a_tactic')).split('\n').length - 1;
+
+        await vscode.commands.executeCommand('easycrypt.resetProof');
+
+        const endPosition = doc.positionAt(source.length);
+        editor.selection = new vscode.Selection(endPosition, endPosition);
+
+        const forward = await vscode.commands.executeCommand('easycrypt.goToCursor');
+        assert.ok(forward && forward.success === false, `Expected goToCursor failure, got: ${JSON.stringify(forward)}`);
+
+        const verifiedRange = await vscode.commands.executeCommand('easycrypt._getVerifiedRange');
+        assert.ok(verifiedRange, 'Expected a verified range after partial replay');
+        assert.ok(
+          verifiedRange.end.line <= failLine,
+          `Expected verified range to stop before failing line ${failLine}, got ${JSON.stringify(verifiedRange)}`
+        );
+
+        const snapshot = await waitForProofStateSettled(120_000);
+        const text = Array.isArray(snapshot?.outputLines) ? snapshot.outputLines.join('\n') : '';
+        assert.ok(
+          /current goal|goal/i.test(text),
+          `Expected snapshot to contain a real goal block, got: ${text.slice(-2000)}`
+        );
+        assert.ok(
+          /error|cannot|unknown|invalid|fail/i.test(text),
+          `Expected snapshot to include a real error text, got: ${text.slice(-2000)}`
+        );
+
+        const reset = await vscode.commands.executeCommand('easycrypt.resetProof');
+        assert.ok(reset && reset.success, `Expected resetProof success after failure, got: ${JSON.stringify(reset)}`);
+
+        const step = await vscode.commands.executeCommand('easycrypt.stepForward');
+        assert.ok(step && step.success, `Expected stepForward success after resetProof, got: ${JSON.stringify(step)}`);
+      } finally {
+        await vscode.commands.executeCommand('easycrypt.stopProcess');
+        await cleanup();
       }
     });
   }

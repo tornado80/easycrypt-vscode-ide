@@ -221,7 +221,7 @@ export class EasyCryptFileSession implements ManagedProofSession {
         }
 
         await this.ensureStarted(token);
-        const result = await this.stepManager.stepBackward();
+        const result = await this.stepManager.stepBackward(false, token);
         if (token?.isCancellationRequested) {
             throw new Error('Command cancelled: stepBackward');
         }
@@ -234,7 +234,7 @@ export class EasyCryptFileSession implements ManagedProofSession {
         }
 
         await this.ensureStarted(token);
-        const result = await this.stepManager.goToCursor();
+        const result = await this.stepManager.goToCursor(token);
         if (token?.isCancellationRequested) {
             throw new Error('Command cancelled: goToCursor');
         }
@@ -263,7 +263,7 @@ export class EasyCryptFileSession implements ManagedProofSession {
         }
 
         await this.ensureStarted(token);
-        const result = await this.stepManager.forceRecovery();
+        const result = await this.stepManager.forceRecovery(token);
         if (token?.isCancellationRequested) {
             throw new Error('Command cancelled: forceRecovery');
         }

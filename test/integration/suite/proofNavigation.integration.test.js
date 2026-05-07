@@ -148,7 +148,7 @@ async function waitForProofStateViewSettled(timeoutMs = 10_000) {
   return vscode.commands.executeCommand('easycrypt._getProofStateViewUpdateCount');
 }
 
-describe('Interactive Proof Navigation E2E (mock easycrypt)', function () {
+describe('Interactive Proof Navigation Integration (mock easycrypt)', function () {
   this.timeout(60_000);
 
   before(async function () {

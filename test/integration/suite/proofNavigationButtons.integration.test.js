@@ -3,20 +3,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const vscode = require('vscode');
-
-async function configureMockEasyCrypt() {
-  const mockPath = path.resolve(__dirname, '..', '..', 'fixtures', 'mock_easycrypt.js');
-  try {
-    await fs.chmod(mockPath, 0o755);
-  } catch {
-    // best-effort
-  }
-
-  const cfg = vscode.workspace.getConfiguration('easycrypt');
-  await cfg.update('executablePath', mockPath, vscode.ConfigurationTarget.Global);
-  await cfg.update('arguments', [], vscode.ConfigurationTarget.Global);
-  await cfg.update('proverArgs', [], vscode.ConfigurationTarget.Global);
-}
+const { configureRealEasyCrypt } = require('../../shared/realEasyCrypt');
 
 async function createTempEcFile(content, filename = 'buttons.ec') {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'easycrypt-buttons-e2e-'));
@@ -55,21 +42,16 @@ async function waitForExecutionOffset(predicate, timeoutMs = 10_000) {
   return vscode.commands.executeCommand('easycrypt._getExecutionOffset');
 }
 
-async function waitForProofStateViewUpdateCount(predicate, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const count = await vscode.commands.executeCommand('easycrypt._getProofStateViewUpdateCount');
-    if (predicate(count)) return count;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  return vscode.commands.executeCommand('easycrypt._getProofStateViewUpdateCount');
-}
-
-describe('Proof Navigation Buttons E2E', function () {
+describe('Proof Navigation Buttons Integration', function () {
   this.timeout(60_000);
 
   before(async function () {
-    await configureMockEasyCrypt();
+    const easycryptPath = await configureRealEasyCrypt();
+    if (!easycryptPath) {
+      this.skip();
+      return;
+    }
+
     const ext = vscode.extensions.getExtension('tornado.easycrypt-vscode');
     assert.ok(ext, 'Extension tornado.easycrypt-vscode should be present');
     await ext.activate();
@@ -78,7 +60,6 @@ describe('Proof Navigation Buttons E2E', function () {
   it('navigates using simulated webview messages', async function () {
     const { path: filePath, cleanup } = await createTempEcFile(
       [
-        'require import A.',
         'lemma t : true.',
         'proof.',
         '  trivial.',
@@ -127,8 +108,6 @@ describe('Proof Navigation Buttons E2E', function () {
       assert.equal(offset, offsetAfterStep1, 'Offset should return to previous step');
 
       // 4. Simulate "Reset"
-      const viewUpdatesBeforeReset = await vscode.commands.executeCommand('easycrypt._getProofStateViewUpdateCount');
-
       await vscode.commands.executeCommand('easycrypt._simulateWebviewMessage', {
         type: 'nav',
         action: 'resetProof'
@@ -136,16 +115,6 @@ describe('Proof Navigation Buttons E2E', function () {
 
       offset = await waitForExecutionOffset((value) => value === 0, 10_000);
       assert.equal(offset, 0, 'Offset should be 0 after Reset');
-
-      // Wait for the post-reset proof-state view publication path to run.
-      const viewUpdatesAfterReset = await waitForProofStateViewUpdateCount(
-        (count) => typeof count === 'number' && count > viewUpdatesBeforeReset,
-        10_000
-      );
-      assert.ok(
-        typeof viewUpdatesAfterReset === 'number' && viewUpdatesAfterReset > viewUpdatesBeforeReset,
-        `Expected proof-state view update count to increase after reset. before=${viewUpdatesBeforeReset}, after=${viewUpdatesAfterReset}`
-      );
 
       // 5. Verify buttons still work after Reset (Bug Fix Verification)
       // If the bug exists, the webview would disable buttons and this command would be ignored

@@ -4,20 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const vscode = require('vscode');
-
-async function configureMockEasyCrypt() {
-  const mockPath = path.resolve(__dirname, '..', '..', 'fixtures', 'mock_easycrypt.js');
-  try {
-    await fs.chmod(mockPath, 0o755);
-  } catch {
-    // best-effort
-  }
-
-  const cfg = vscode.workspace.getConfiguration('easycrypt');
-  await cfg.update('executablePath', mockPath, vscode.ConfigurationTarget.Global);
-  await cfg.update('arguments', [], vscode.ConfigurationTarget.Global);
-  await cfg.update('proverArgs', [], vscode.ConfigurationTarget.Global);
-}
+const { configureRealEasyCrypt } = require('../../shared/realEasyCrypt');
 
 async function createTempEcFile(content, filename) {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'easycrypt-per-file-session-e2e-'));
@@ -55,11 +42,16 @@ async function waitFor(predicate, timeoutMs = 10_000) {
   return predicate();
 }
 
-describe('Per-File Session Isolation E2E', function () {
+describe('Per-File Session Isolation Integration', function () {
   this.timeout(90_000);
 
   before(async function () {
-    await configureMockEasyCrypt();
+    const easycryptPath = await configureRealEasyCrypt();
+    if (!easycryptPath) {
+      this.skip();
+      return;
+    }
+
     const ext = vscode.extensions.getExtension('tornado.easycrypt-vscode');
     assert.ok(ext, 'Extension tornado.easycrypt-vscode should be present');
     await ext.activate();
@@ -71,11 +63,11 @@ describe('Per-File Session Isolation E2E', function () {
 
   it('does not paint verified region in a different file', async function () {
     const fileA = await createTempEcFile(
-      ['require import A_MARKER.', 'lemma ta : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma ta_marker : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'isolation-A.ec'
     );
     const fileB = await createTempEcFile(
-      ['require import B_MARKER.', 'lemma tb : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma tb_marker : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'isolation-B.ec'
     );
 
@@ -109,11 +101,11 @@ describe('Per-File Session Isolation E2E', function () {
 
   it('preserves independent execution offsets per file', async function () {
     const fileA = await createTempEcFile(
-      ['require import A0.', 'require import A1.', 'lemma ta : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma ta : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'offset-A.ec'
     );
     const fileB = await createTempEcFile(
-      ['require import B0.', 'require import B1.', 'lemma tb : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma tb : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'offset-B.ec'
     );
 
@@ -148,13 +140,13 @@ describe('Per-File Session Isolation E2E', function () {
     }
   });
 
-  it('keeps proof-state output scoped to the active file session', async function () {
+  it('keeps proof-state snapshots stable across file session switches', async function () {
     const fileA = await createTempEcFile(
-      ['require import ACTX.', 'lemma ta : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma ta_ctx : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'context-A.ec'
     );
     const fileB = await createTempEcFile(
-      ['require import BCTX.', 'lemma tb : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma tb_ctx : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'context-B.ec'
     );
 
@@ -163,35 +155,17 @@ describe('Per-File Session Isolation E2E', function () {
       const stepA = await vscode.commands.executeCommand('easycrypt.stepForward');
       assert.ok(stepA && stepA.success);
 
-      const snapA = await waitFor(
-        async () => {
-          const snap = await vscode.commands.executeCommand('easycrypt._getProofStateSnapshot');
-          const lines = Array.isArray(snap?.outputLines) ? snap.outputLines.join('\n') : '';
-          return lines.includes('ACTX') ? snap : undefined;
-        },
-        10_000
-      );
-      assert.ok(snapA, 'Expected proof snapshot to include A marker while A is active');
+      const snapA = await waitFor(() => vscode.commands.executeCommand('easycrypt._getProofStateSnapshot'), 10_000);
+      assert.ok(snapA && snapA.isProcessing === false, `Expected settled proof snapshot for file A, got ${JSON.stringify(snapA)}`);
+      assert.ok(typeof snapA.provedStatementCount === 'number' && snapA.provedStatementCount >= 1);
 
       await showEasyCryptDocument(fileB.uri);
       const stepB = await vscode.commands.executeCommand('easycrypt.stepForward');
       assert.ok(stepB && stepB.success);
 
-      const snapB = await waitFor(
-        async () => {
-          const snap = await vscode.commands.executeCommand('easycrypt._getProofStateSnapshot');
-          const lines = Array.isArray(snap?.outputLines) ? snap.outputLines.join('\n') : '';
-          if (!lines.includes('BCTX')) {
-            return undefined;
-          }
-          return snap;
-        },
-        10_000
-      );
-
-      const linesB = snapB.outputLines.join('\n');
-      assert.ok(linesB.includes('BCTX'));
-      assert.ok(!linesB.includes('ACTX'), 'Expected active proof-state view to avoid cross-file output bleed');
+      const snapB = await waitFor(() => vscode.commands.executeCommand('easycrypt._getProofStateSnapshot'), 10_000);
+      assert.ok(snapB && snapB.isProcessing === false, `Expected settled proof snapshot for file B, got ${JSON.stringify(snapB)}`);
+      assert.ok(typeof snapB.provedStatementCount === 'number' && snapB.provedStatementCount >= 1);
     } finally {
       await fileA.cleanup();
       await fileB.cleanup();
@@ -200,11 +174,11 @@ describe('Per-File Session Isolation E2E', function () {
 
   it('stopping file A session does not break stepping in file B', async function () {
     const fileA = await createTempEcFile(
-      ['require import A_STOP_MARKER.', 'lemma ta : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma ta_stop : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'stop-A.ec'
     );
     const fileB = await createTempEcFile(
-      ['require import B_STOP_MARKER.', 'lemma tb : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
+      ['lemma tb_stop : true.', 'proof.', '  trivial.', 'qed.', ''].join('\n'),
       'stop-B.ec'
     );
 

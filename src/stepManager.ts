@@ -21,7 +21,7 @@ import { StatementIndex } from './statementIndex';
 import { parseOutput } from './outputParser';
 import { EmacsPromptCounter } from './emacsPromptCounter';
 import { Logger } from './logger';
-import { UndoStateTracker, extractAllPrompts, PromptInfo } from './undoStateTracker';
+import { UndoStateTracker, extractAllPrompts } from './undoStateTracker';
 import {
     SessionContextFingerprint,
     fingerprintVerificationContext,
@@ -42,6 +42,22 @@ export interface StepResult {
     output?: string;
     /** Execution offset after the operation */
     executionOffset?: number;
+}
+
+export interface ReplayPlan {
+    startOffset: number;
+    targetOffset: number;
+    origin: 'goToCursor-forward' | 'recovery';
+    suppressIntermediateUi: boolean;
+}
+
+export interface ReplayOutcome {
+    success: boolean;
+    executionOffset: number;
+    processedStatementCount: number;
+    failedStatement?: Statement;
+    output?: ProcessOutput;
+    error?: string;
 }
 
 /**
@@ -300,11 +316,13 @@ export class StepManager implements vscode.Disposable {
      * 
      * @returns Result of the recovery operation
      */
-    public async forceRecovery(): Promise<StepResult> {
+    public async forceRecovery(token?: vscode.CancellationToken): Promise<StepResult> {
         const editor = vscode.window.activeTextEditor;
         if (!editor || editor.document.languageId !== 'easycrypt') {
             return { success: false, error: 'No active EasyCrypt file' };
         }
+
+        this.throwIfCancelled(token, 'forceRecovery');
 
         if (this.stepping || this.retracting || this.recovering) {
             return { success: false, error: 'Operation already in progress' };
@@ -328,7 +346,7 @@ export class StepManager implements vscode.Disposable {
             return { success: false, error: `Failed to bind session context: ${msg}` };
         }
 
-        return await this.recoverState(currentOffset, editor);
+        return await this.recoverState(currentOffset, editor, token);
     }
 
     /**
@@ -433,6 +451,33 @@ export class StepManager implements vscode.Disposable {
         if (startsAfter > startsBefore) {
             this.undoStateTracker.initialize(0);
         }
+    }
+
+    private throwIfCancelled(token: vscode.CancellationToken | undefined, operation: string): void {
+        if (token?.isCancellationRequested) {
+            throw new Error(`Command cancelled: ${operation}`);
+        }
+    }
+
+    private isCancellationError(err: unknown): boolean {
+        if (!(err instanceof Error)) {
+            return false;
+        }
+
+        return err.message.startsWith('Command cancelled');
+    }
+
+    private createEmptyOutput(fileUri?: vscode.Uri): ProcessOutput {
+        return {
+            raw: '',
+            parsed: {
+                errors: [],
+                success: true,
+                proofCompleted: false,
+                remainingOutput: ''
+            },
+            fileUri
+        };
     }
 
     /**
@@ -571,11 +616,13 @@ export class StepManager implements vscode.Disposable {
      * @param internal - Whether this is an internal call (e.g., from retraction)
      * @returns Result of the step operation
      */
-    public async stepBackward(internal: boolean = false): Promise<StepResult> {
+    public async stepBackward(internal: boolean = false, token?: vscode.CancellationToken): Promise<StepResult> {
         const editor = vscode.window.activeTextEditor;
         if (!editor || editor.document.languageId !== 'easycrypt') {
             return { success: false, error: 'No active EasyCrypt file' };
         }
+
+        this.throwIfCancelled(token, 'stepBackward');
         
         if (this.stepping || (!internal && this.retracting)) {
             return { success: false, error: 'Step already in progress' };
@@ -618,6 +665,7 @@ export class StepManager implements vscode.Disposable {
                 const undoResult = await this.tryUndoToState(targetCount, currentCount, editor);
                 if (undoResult.success) {
                     this.log(`Fast undo-to-state succeeded`);
+                    this.throwIfCancelled(token, 'stepBackward');
                     const result: StepResult = {
                         success: true,
                         output: undoResult.output,
@@ -633,7 +681,7 @@ export class StepManager implements vscode.Disposable {
             }
             
             // Fallback: restart + replay
-            const recoveryResult = await this.recoverState(newOffset, editor);
+            const recoveryResult = await this.recoverState(newOffset, editor, token);
             const result: StepResult = {
                 success: recoveryResult.success,
                 error: recoveryResult.error,
@@ -760,36 +808,26 @@ export class StepManager implements vscode.Disposable {
     }
 
     /**
-     * Recovers the proof state by resetting and fast-forwarding.
-     * 
-     * This is the Smart Recovery mechanism: when undo fails or the session
-     * is desynchronized, we reset the EasyCrypt session and re-execute
-     * all statements from the start up to the target offset.
-     * 
-     * UI Suppression: During recovery, the verified range is NOT updated
-     * incrementally. Instead, a "verifying" range is shown for the pending
-     * region, and the verified range is updated only once at completion.
-     * Uses transactional proof-state updates to prevent flicker.
-     * 
-     * @param targetOffset - The offset to recover to
-     * @param editor - The active text editor
-     * @returns Result of the recovery operation
+     * Recovers the proof state by resetting and replaying statements with
+     * statement-level backpressure.
      */
-    private async recoverState(targetOffset: number, editor: vscode.TextEditor): Promise<StepResult> {
+    private async recoverState(
+        targetOffset: number,
+        editor: vscode.TextEditor,
+        token?: vscode.CancellationToken
+    ): Promise<StepResult> {
         if (this.recovering) {
             return { success: false, error: 'Recovery already in progress' };
         }
 
+        this.throwIfCancelled(token, 'recovery');
+
         this.recovering = true;
         this.log(`Starting recovery to offset ${targetOffset}...`);
 
-        // Begin transaction for UI suppression
         const tx = this.proofStateManager.beginTransaction('recovery');
-
-        // Show status message to user
         const statusMessage = vscode.window.setStatusBarMessage('$(sync~spin) Recovering proof state...');
 
-        // Show verifying range for the target region (UI suppression)
         const verifyingRange = new vscode.Range(
             new vscode.Position(0, 0),
             editor.document.positionAt(targetOffset)
@@ -797,118 +835,62 @@ export class StepManager implements vscode.Disposable {
         this.decorator.setVerifyingRange(editor, verifyingRange);
 
         try {
-            // Step 1: Reset the EasyCrypt session.
-            // In some EasyCrypt versions, `reset.` is not a supported REPL command in cli/emacs mode
-            // (it returns a parse error). The most reliable reset is a full process restart.
             await this.restartProcessForRecovery(editor.document);
-
-            // Step 2: Reset internal state (but don't update decorations yet - UI suppression)
             this.executionOffset = 0;
 
-            // Step 3: Fast-forward to target offset (prefer one-shot batch).
-            const text = editor.document.getText();
-            
-            // Update statement index for efficient access
-            this.statementIndex.update(text, editor.document.version);
-            const statements = this.statementIndex.getStatementsUpTo(targetOffset);
+            const outcome = await this.replayToOffsetSerial(
+                {
+                    startOffset: 0,
+                    targetOffset,
+                    origin: 'recovery',
+                    suppressIntermediateUi: true
+                },
+                editor,
+                token
+            );
 
-            if (statements.length === 0) {
-                this.executionOffset = 0;
-                this.updateDecorations();
-                this._onDidChangePosition.fire(this.getExecutionPosition());
-                // End transaction with empty output and progress
-                const progress = this.computeProgressSnapshot();
-                this.proofStateManager.endTransaction(tx, { raw: '', parsed: { errors: [], success: true, proofCompleted: false, remainingOutput: '' } }, progress);
-                this.log('Recovery complete (no statements to replay).');
-                return { success: true, executionOffset: this.executionOffset };
-            }
+            this.throwIfCancelled(token, 'recovery-finalize');
 
-            const batchedText = statements.map(stmt => stmt.text).join('\n');
-            const batchedOutput = await this.sendAndWait(batchedText, editor.document.uri, statements.length);
-
-            if (batchedOutput.parsed.errors.length === 0) {
-                // Success: update verified range once at the end
-                this.executionOffset = statements[statements.length - 1].endOffset;
-                this.updateDecorations();
-                this._onDidChangePosition.fire(this.getExecutionPosition());
-                
-                // Rebuild undo state tracking from the batch output prompts
-                this.rebuildUndoStateFromBatch(batchedOutput.raw ?? '', statements.length);
-                
-                // End transaction with final output and progress
-                const progress = this.computeProgressSnapshot();
-                this.proofStateManager.endTransaction(tx, batchedOutput, progress);
-                this.log(`Recovery complete (batched). Replayed ${statements.length} statements. Final offset: ${this.executionOffset}`);
-                return { success: true, executionOffset: this.executionOffset, output: batchedOutput.raw };
-            }
-
-            this.log('Batched replay produced an error; attempting sequential fallback replay.');
-
-            // Sequential fallback: re-run statements one by one so batch-only failures can recover.
-            // We keep the already restarted process (single restart semantics).
-            // UI suppression: still don't update verified range incrementally
-            // Track undo state during sequential replay
-            let lastOutput: ProcessOutput | undefined;
-            this.executionOffset = 0;
-            // Reset undo tracker since we're starting fresh after failed batch
-            this.undoStateTracker.reset();
-            this.undoStateTracker.initialize(0);
-            
-            for (let i = 0; i < statements.length; i++) {
-                const statement = statements[i];
-                
-                // Track undo state: capture pre-state
-                this.undoStateTracker.beforeStatementSend(i);
-                
-                lastOutput = await this.sendAndWait(statement.text, editor.document.uri);
-
-                if (lastOutput.parsed.errors.length > 0) {
-                    const message = lastOutput.parsed.errors[0]?.message ?? 'Unknown EasyCrypt error';
-                    this.log(`Recovery stopped at offset ${this.executionOffset}: ${message}`);
-                    // Update verified range only at the end
-                    this.updateDecorations();
-                    this._onDidChangePosition.fire(this.getExecutionPosition());
-                    // End transaction with error output and progress
-                    const progress = this.computeProgressSnapshot();
-                    this.proofStateManager.endTransaction(tx, lastOutput, progress);
-                    return {
-                        success: false,
-                        error: `Recovery stopped: ${message}`,
-                        statement,
-                        output: lastOutput.raw,
-                        executionOffset: this.executionOffset
-                    };
-                }
-                
-                // Track undo state: record post-state
-                const prompts = extractAllPrompts(lastOutput.raw ?? '');
-                if (prompts.length > 0) {
-                    const lastPrompt = prompts[prompts.length - 1];
-                    this.undoStateTracker.afterStatementProcessed(i, lastPrompt.promptInfo);
-                }
-
-                this.executionOffset = statement.endOffset;
-            }
-
-            // Success: update verified range once at the end
             this.updateDecorations();
             this._onDidChangePosition.fire(this.getExecutionPosition());
-            if (lastOutput) {
-                // End transaction with final output and progress
-                const progress = this.computeProgressSnapshot();
-                this.proofStateManager.endTransaction(tx, lastOutput, progress);
-            } else {
-                // Shouldn't happen, but handle gracefully
-                const progress = this.computeProgressSnapshot();
-                this.proofStateManager.endTransaction(tx, { raw: '', parsed: { errors: [], success: true, proofCompleted: false, remainingOutput: '' } }, progress);
-            }
-            this.log(`Recovery complete (sequential fallback). Replayed ${statements.length} statements. Final offset: ${this.executionOffset}`);
-            return { success: true, executionOffset: this.executionOffset, output: lastOutput?.raw };
 
+            const progress = this.computeProgressSnapshot();
+            this.proofStateManager.endTransaction(
+                tx,
+                outcome.output ?? this.createEmptyOutput(editor.document.uri),
+                progress
+            );
+
+            if (!outcome.success) {
+                const message = outcome.error ?? 'Unknown EasyCrypt error';
+                this.log(`Recovery stopped at offset ${this.executionOffset}: ${message}`);
+                return {
+                    success: false,
+                    error: `Recovery stopped: ${message}`,
+                    statement: outcome.failedStatement,
+                    output: outcome.output?.raw,
+                    executionOffset: this.executionOffset
+                };
+            }
+
+            this.log(
+                `Recovery complete (serial). Replayed ${outcome.processedStatementCount} statements. ` +
+                `Final offset: ${this.executionOffset}`
+            );
+            return {
+                success: true,
+                executionOffset: this.executionOffset,
+                output: outcome.output?.raw
+            };
         } catch (err) {
+            if (this.isCancellationError(err)) {
+                this.log('Recovery cancelled');
+                this.proofStateManager.failTransaction(tx, 'Command cancelled');
+                throw err;
+            }
+
             const msg = err instanceof Error ? err.message : String(err);
             this.log(`Recovery failed: ${msg}`);
-            // Fail transaction with error
             this.proofStateManager.failTransaction(tx, `Recovery failed: ${msg}`);
             return {
                 success: false,
@@ -917,7 +899,6 @@ export class StepManager implements vscode.Disposable {
             };
         } finally {
             this.recovering = false;
-            // Clear verifying range
             this.decorator.setVerifyingRange(editor, undefined);
             statusMessage.dispose();
         }
@@ -932,107 +913,15 @@ export class StepManager implements vscode.Disposable {
     }
 
     /**
-     * Rebuilds the undo state tracking from batch output prompts.
-     * 
-     * After a successful batch execution, we need to reconstruct the
-     * statement -> uuid mapping from the prompts in the output.
-     * 
-     * @param rawOutput - The raw batch output containing prompts
-     * @param statementCount - Number of statements in the batch
+     * Steps to the cursor position.
      */
-    private rebuildUndoStateFromBatch(rawOutput: string, statementCount: number): void {
-        const prompts = extractAllPrompts(rawOutput);
-        
-        // Filter out the startup prompt [0|check]> if present
-        const responsePrompts = prompts.filter(p => p.promptInfo.uuid > 0);
-        
-        if (responsePrompts.length < statementCount) {
-            this.log(
-                `Warning: Not enough prompts to rebuild undo state. ` +
-                `Expected ${statementCount}, got ${responsePrompts.length}. ` +
-                `Undo-to-state will not be available for this session.`
-            );
-            // Don't invalidate - just don't update. The tracker was initialized at 0,
-            // and we can't reliably map statements to uuids.
-            return;
-        }
-        
-        // Build the mapping: for each statement i, preStateUuid[i] = uuid before statement i
-        // After the batch, we have prompts [1, 2, 3, ...] for statements [0, 1, 2, ...]
-        // So preStateUuid[0] = 0, preStateUuid[1] = 1, etc.
-        const promptInfos: PromptInfo[] = [];
-        for (let i = 0; i < statementCount; i++) {
-            promptInfos.push(responsePrompts[i].promptInfo);
-        }
-        
-        // Use afterBatchProcessed to update the tracker
-        const success = this.undoStateTracker.afterBatchProcessed(0, statementCount, promptInfos);
-        if (!success) {
-            this.log(`Failed to rebuild undo state from batch`);
-        } else {
-            this.log(`Successfully rebuilt undo state for ${statementCount} statements`);
-        }
-    }
-
-    /**
-     * Updates the undo state tracking from batch output prompts.
-     * 
-     * Unlike rebuildUndoStateFromBatch, this appends to the existing mapping
-     * rather than replacing it (used for forward batch stepping).
-     * 
-     * @param rawOutput - The raw batch output containing prompts
-     * @param startStatementIndex - The starting statement index
-     * @param statementCount - Number of statements in the batch
-     */
-    private updateUndoStateFromBatch(rawOutput: string, startStatementIndex: number, statementCount: number): void {
-        const prompts = extractAllPrompts(rawOutput);
-        
-        // Filter out the startup prompt [0|check]> if present
-        const responsePrompts = prompts.filter(p => p.promptInfo.uuid > 0);
-        
-        if (responsePrompts.length < statementCount) {
-            this.log(
-                `Warning: Not enough prompts to update undo state. ` +
-                `Expected ${statementCount}, got ${responsePrompts.length}.`
-            );
-            return;
-        }
-        
-        // Build the mapping for this batch
-        const promptInfos: PromptInfo[] = [];
-        for (let i = 0; i < statementCount; i++) {
-            promptInfos.push(responsePrompts[i].promptInfo);
-        }
-        
-        // Use afterBatchProcessed to update the tracker
-        const success = this.undoStateTracker.afterBatchProcessed(startStatementIndex, statementCount, promptInfos);
-        if (!success) {
-            this.log(`Failed to update undo state from batch`);
-        } else {
-            this.log(`Successfully updated undo state for ${statementCount} statements starting at index ${startStatementIndex}`);
-        }
-    }
-
-    /**
-     * Steps to the cursor position
-     * 
-     * Implements Smart Recovery: If stepping backward fails, automatically
-     * falls back to full recovery (reset + fast-forward).
-     * 
-     * Uses StatementIndex for efficient cursor-to-statement mapping.
-     * UI Suppression: For multi-statement operations, shows a "verifying" range
-     * and updates the verified range only once at completion.
-     * 
-     * For backward navigation, first attempts fast undo-to-state if the
-     * UndoStateTracker has a valid mapping.
-     * 
-     * @returns Result of the operation
-     */
-    public async goToCursor(): Promise<StepResult> {
+    public async goToCursor(token?: vscode.CancellationToken): Promise<StepResult> {
         const editor = vscode.window.activeTextEditor;
         if (!editor || editor.document.languageId !== 'easycrypt') {
             return { success: false, error: 'No active EasyCrypt file' };
         }
+
+        this.throwIfCancelled(token, 'goToCursor');
         
         if (this.stepping || this.retracting || this.recovering) {
             return { success: false, error: 'Step already in progress' };
@@ -1081,6 +970,7 @@ export class StepManager implements vscode.Disposable {
                     const undoResult = await this.tryUndoToState(targetCount, currentCount, editor);
                     if (undoResult.success) {
                         this.log(`Fast undo-to-state succeeded for goToCursor`);
+                        this.throwIfCancelled(token, 'goToCursor');
                         this._onDidCompleteStep.fire(undoResult);
                         return undoResult;
                     }
@@ -1094,32 +984,26 @@ export class StepManager implements vscode.Disposable {
             
             // Fallback: use recovery
             this.log(`Backward goToCursor uses recovery to offset ${targetOffset}`);
-            return await this.recoverState(targetOffset, editor);
+            return await this.recoverState(targetOffset, editor, token);
         } else {
-            // Forward navigation - batch step with UI suppression
-            return await this.batchStepForward(targetOffset, editor);
+            return await this.batchStepForward(targetOffset, editor, token);
         }
     }
 
     /**
-     * Batch step forward to a target offset with UI suppression.
-     * 
-     * Shows a "verifying" range during processing and updates the
-     * verified range only once at completion.
-     * Uses transactional proof-state updates to prevent flicker.
-     * 
-     * @param targetOffset - The target offset to step to
-     * @param editor - The active text editor
-     * @returns Result of the operation
+     * Forward replay to a target offset with statement-level backpressure.
      */
-    private async batchStepForward(targetOffset: number, editor: vscode.TextEditor): Promise<StepResult> {
+    private async batchStepForward(
+        targetOffset: number,
+        editor: vscode.TextEditor,
+        token?: vscode.CancellationToken
+    ): Promise<StepResult> {
+        this.throwIfCancelled(token, 'goToCursor-forward');
+
         const text = editor.document.getText();
         
-        // Get statements from current position to target
         this.statementIndex.update(text, editor.document.version);
         const allStatements = this.statementIndex.getStatementsInRange(this.executionOffset, targetOffset);
-        
-        // Filter to only statements we haven't executed yet
         const statements = allStatements.filter(stmt => stmt.endOffset > this.executionOffset && stmt.endOffset <= targetOffset);
         
         if (statements.length === 0) {
@@ -1131,123 +1015,77 @@ export class StepManager implements vscode.Disposable {
             return await this.stepForward();
         }
         
-        // Get the starting statement index for undo tracking
-        const currentStatements = this.statementIndex.getStatementsUpTo(this.executionOffset);
-        const startStatementIndex = currentStatements.length;
-        
-        // Multi-statement batch - use transaction for UI suppression
         this.stepping = true;
         this._onDidStartStep.fire();
-        
-        // Begin transaction for batch operation
-        const tx = this.proofStateManager.beginTransaction('batch-forward');
-        
-        // Show verifying range for the pending region
+
+        const tx = this.proofStateManager.beginTransaction('go-to-cursor');
         const verifyingRange = new vscode.Range(
             editor.document.positionAt(this.executionOffset),
             editor.document.positionAt(targetOffset)
         );
         this.decorator.setVerifyingRange(editor, verifyingRange);
-        
-        this.log(`Batch stepping forward: ${statements.length} statements to offset ${targetOffset} (startIndex=${startStatementIndex})`);
+
+        this.log(`Forward replay (serial): ${statements.length} statements to offset ${targetOffset}`);
         
         try {
-            // Try batched execution first
-            const batchedText = statements.map(stmt => stmt.text).join('\n');
-            const batchedOutput = await this.sendAndWait(batchedText, editor.document.uri, statements.length);
-            
-            if (batchedOutput.parsed.errors.length === 0) {
-                // Success - update execution offset and decorations once
-                this.executionOffset = statements[statements.length - 1].endOffset;
-                this.updateDecorations();
-                this._onDidChangePosition.fire(this.getExecutionPosition());
-                
-                // Update undo state tracking from the batch output
-                this.updateUndoStateFromBatch(batchedOutput.raw ?? '', startStatementIndex, statements.length);
+            const outcome = await this.replayToOffsetSerial(
+                {
+                    startOffset: this.executionOffset,
+                    targetOffset,
+                    origin: 'goToCursor-forward',
+                    suppressIntermediateUi: true
+                },
+                editor,
+                token
+            );
 
-                // End transaction with final output and progress
-                const progress = this.computeProgressSnapshot();
-                this.proofStateManager.endTransaction(tx, batchedOutput, progress);
-                
-                this.log(`Batch step complete. Final offset: ${this.executionOffset}`);
-                const result: StepResult = {
-                    success: true,
-                    output: batchedOutput.raw,
-                    executionOffset: this.executionOffset
-                };
-                this._onDidCompleteStep.fire(result);
-                return result;
-            }
-            
-            this.log('Batched step produced an error; attempting sequential fallback.');
-            
-            // Sequential fallback - still with UI suppression (no intermediate decoration updates)
-            // Track undo state for each statement
-            let lastOutput: ProcessOutput | undefined;
-            let failedStatement: Statement | undefined;
-            let currentIndex = startStatementIndex;
-            
-            for (const statement of statements) {
-                // Track undo state: capture pre-state
-                this.undoStateTracker.beforeStatementSend(currentIndex);
-                
-                lastOutput = await this.sendAndWait(statement.text, editor.document.uri);
-                
-                if (lastOutput.parsed.errors.length > 0) {
-                    failedStatement = statement;
-                    break;
-                }
-                
-                // Track undo state: record post-state
-                const prompts = extractAllPrompts(lastOutput.raw ?? '');
-                if (prompts.length > 0) {
-                    const lastPrompt = prompts[prompts.length - 1];
-                    this.undoStateTracker.afterStatementProcessed(currentIndex, lastPrompt.promptInfo);
-                }
-                
-                this.executionOffset = statement.endOffset;
-                currentIndex++;
-            }
-            
-            // Update decorations once at the end
+            this.throwIfCancelled(token, 'goToCursor-forward-finalize');
+
             this.updateDecorations();
             this._onDidChangePosition.fire(this.getExecutionPosition());
 
-            // End transaction with final output and progress
             const progress = this.computeProgressSnapshot();
-            if (lastOutput) {
-                this.proofStateManager.endTransaction(tx, lastOutput, progress);
-            } else {
-                // Shouldn't happen, but handle gracefully
-                this.proofStateManager.endTransaction(tx, { raw: '', parsed: { errors: [], success: true, proofCompleted: false, remainingOutput: '' } }, progress);
-            }
-            
-            if (failedStatement) {
-                const message = lastOutput?.parsed.errors[0]?.message ?? 'Unknown EasyCrypt error';
-                this.log(`Batch step stopped at offset ${this.executionOffset}: ${message}`);
+            this.proofStateManager.endTransaction(
+                tx,
+                outcome.output ?? this.createEmptyOutput(editor.document.uri),
+                progress
+            );
+
+            if (!outcome.success) {
+                const message = outcome.error ?? 'Unknown EasyCrypt error';
+                this.log(`Forward replay stopped at offset ${this.executionOffset}: ${message}`);
                 const result: StepResult = {
                     success: false,
                     error: message,
-                    statement: failedStatement,
-                    output: lastOutput?.raw,
+                    statement: outcome.failedStatement,
+                    output: outcome.output?.raw,
                     executionOffset: this.executionOffset
                 };
                 this._onDidCompleteStep.fire(result);
                 return result;
             }
-            
-            this.log(`Batch step complete (sequential fallback). Final offset: ${this.executionOffset}`);
+
+            this.log(
+                `Forward replay complete. Replayed ${outcome.processedStatementCount} statements. ` +
+                `Final offset: ${this.executionOffset}`
+            );
             const result: StepResult = {
                 success: true,
-                output: lastOutput?.raw,
+                output: outcome.output?.raw,
                 executionOffset: this.executionOffset
             };
             this._onDidCompleteStep.fire(result);
             return result;
             
         } catch (err) {
+            if (this.isCancellationError(err)) {
+                this.log('Forward goToCursor replay cancelled');
+                this.proofStateManager.failTransaction(tx, 'Command cancelled');
+                throw err;
+            }
+
             const msg = err instanceof Error ? err.message : String(err);
-            this.log(`Batch step error: ${msg}`);
+            this.log(`Forward replay error: ${msg}`);
             this.proofStateManager.failTransaction(tx, msg);
             const result: StepResult = {
                 success: false,
@@ -1261,6 +1099,78 @@ export class StepManager implements vscode.Disposable {
             this.stepping = false;
             this.decorator.setVerifyingRange(editor, undefined);
         }
+    }
+
+    private async replayToOffsetSerial(
+        plan: ReplayPlan,
+        editor: vscode.TextEditor,
+        token?: vscode.CancellationToken
+    ): Promise<ReplayOutcome> {
+        const text = editor.document.getText();
+        this.statementIndex.update(text, editor.document.version);
+
+        const allStatements = this.statementIndex.getStatementsInRange(plan.startOffset, plan.targetOffset);
+        const statements = allStatements.filter(
+            (stmt) => stmt.endOffset > plan.startOffset && stmt.endOffset <= plan.targetOffset
+        );
+
+        if (statements.length === 0) {
+            return {
+                success: true,
+                executionOffset: this.executionOffset,
+                processedStatementCount: 0,
+                output: this.createEmptyOutput(editor.document.uri)
+            };
+        }
+
+        const startStatementIndex = this.statementIndex.getStatementsUpTo(plan.startOffset).length;
+        let currentStatementIndex = startStatementIndex;
+        let lastOutput: ProcessOutput | undefined;
+
+        this.log(
+            `Serial replay start: origin=${plan.origin}, statements=${statements.length}, ` +
+            `startOffset=${plan.startOffset}, targetOffset=${plan.targetOffset}`
+        );
+
+        for (const statement of statements) {
+            this.throwIfCancelled(token, `${plan.origin}:before-send`);
+
+            this.undoStateTracker.beforeStatementSend(currentStatementIndex);
+            lastOutput = await this.sendAndWait(statement.text, editor.document.uri, 1, token);
+
+            if (lastOutput.parsed.errors.length > 0) {
+                const message = lastOutput.parsed.errors[0]?.message ?? 'Unknown EasyCrypt error';
+                this.log(`Serial replay stopped at statementIndex=${currentStatementIndex}: ${message}`);
+                return {
+                    success: false,
+                    executionOffset: this.executionOffset,
+                    processedStatementCount: (currentStatementIndex - startStatementIndex) + 1,
+                    failedStatement: statement,
+                    output: lastOutput,
+                    error: message
+                };
+            }
+
+            const prompts = extractAllPrompts(lastOutput.raw ?? '');
+            if (prompts.length > 0) {
+                const lastPrompt = prompts[prompts.length - 1];
+                this.undoStateTracker.afterStatementProcessed(currentStatementIndex, lastPrompt.promptInfo);
+            } else {
+                this.log('Warning: No prompt found in replay output, undo tracking may be incomplete');
+            }
+
+            this.executionOffset = statement.endOffset;
+            currentStatementIndex++;
+
+            this.throwIfCancelled(token, `${plan.origin}:after-send`);
+        }
+
+        return {
+            success: true,
+            executionOffset: this.executionOffset,
+            processedStatementCount: statements.length,
+            output: lastOutput ?? this.createEmptyOutput(editor.document.uri)
+        };
     }
 
     /**
@@ -1294,12 +1204,24 @@ export class StepManager implements vscode.Disposable {
     /**
      * Sends a command and waits for output
      */
-    private async sendAndWait(command: string, fileUri?: vscode.Uri, expectedPromptCount: number = 1): Promise<ProcessOutput> {
+    private async sendAndWait(
+        command: string,
+        fileUri?: vscode.Uri,
+        expectedPromptCount: number = 1,
+        token?: vscode.CancellationToken
+    ): Promise<ProcessOutput> {
+        this.throwIfCancelled(token, 'sendAndWait');
+
         if (this.pendingCommand) {
             throw new Error('Another EasyCrypt command is already pending');
         }
 
         return new Promise((resolve, reject) => {
+            if (token?.isCancellationRequested) {
+                reject(new Error('Command cancelled: sendAndWait'));
+                return;
+            }
+
             const timeoutHandle = setTimeout(() => {
                 if (this.pendingCommand) {
                     const pending = this.pendingCommand;

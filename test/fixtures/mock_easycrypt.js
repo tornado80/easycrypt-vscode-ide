@@ -159,6 +159,7 @@ if (looksLikeFlag(command)) {
     });
 
     let lineNumber = 1;
+    let processedCommandCount = 0;
     let lastCommandTimeMs = 0;
     let rapidCommandStreak = 0;
     let promptCounter = 1;
@@ -174,6 +175,7 @@ if (looksLikeFlag(command)) {
     const coalesceFirstPromptWithNextOutput = process.env.MOCK_EC_COALESCE_FIRST_PROMPT_WITH_NEXT_OUTPUT === '1';
     let firstProcessedStatement = true;
     let pendingCoalescedPromptLine = undefined;
+    let pendingCoalescedPromptFlushTimer = undefined;
 
     // Tracks whether multiple input lines arrived in the same burst.
     // Used to simulate "batch-only" failures deterministically.
@@ -191,6 +193,10 @@ if (looksLikeFlag(command)) {
     // prompt counting robustness.
     const emitLeadingPrompt = process.env.MOCK_EC_LEADING_PROMPT === '1';
     let firstCommandAfterStart = true;
+
+    const failingGoalMarker = process.env.MOCK_EC_FAILING_GOAL_MARKER;
+    const failingErrorMarker = process.env.MOCK_EC_FAILING_ERROR_MARKER;
+    const failAtCommandIndex = Number(process.env.MOCK_EC_FAIL_AT_COMMAND_INDEX ?? '0');
 
     /**
      * Serialize all stdout writes so delayed prompt emission doesn't reorder output.
@@ -212,6 +218,11 @@ if (looksLikeFlag(command)) {
     };
 
     const maybeFlushCoalescedPrompt = () => {
+        if (pendingCoalescedPromptFlushTimer) {
+            clearTimeout(pendingCoalescedPromptFlushTimer);
+            pendingCoalescedPromptFlushTimer = undefined;
+        }
+
         if (pendingCoalescedPromptLine) {
             writeLine(pendingCoalescedPromptLine);
             pendingCoalescedPromptLine = undefined;
@@ -222,6 +233,11 @@ if (looksLikeFlag(command)) {
         if (coalesceFirstPromptWithNextOutput && firstProcessedStatement) {
             // Hold the prompt and write it before the next statement's output.
             pendingCoalescedPromptLine = `[${promptCounter++}|check]>`;
+            pendingCoalescedPromptFlushTimer = setTimeout(() => {
+                enqueue(async () => {
+                    maybeFlushCoalescedPrompt();
+                });
+            }, 5);
         } else {
             await emitPrompt();
         }
@@ -235,6 +251,11 @@ if (looksLikeFlag(command)) {
                 // Skip empty lines and comments
                 lineNumber++;
                 return;
+            }
+
+            const isStatementTerminatorLine = /\.\s*$/.test(trimmed);
+            if (isStatementTerminatorLine) {
+                processedCommandCount++;
             }
 
             if (strictImportResolution) {
@@ -259,6 +280,22 @@ if (looksLikeFlag(command)) {
                 // In real EasyCrypt this would be the previous command's trailing prompt.
                 writeLine(`[0|check]>`);
                 firstCommandAfterStart = false;
+            }
+
+            if (failAtCommandIndex > 0 && isStatementTerminatorLine && processedCommandCount === failAtCommandIndex) {
+                maybeFlushCoalescedPrompt();
+                if (failingGoalMarker) {
+                    writeLine('Current goal');
+                    writeLine(`  ${failingGoalMarker}`);
+                }
+                const forcedErrorMessage = failingErrorMarker
+                    ? `${failingErrorMarker}: forced command failure ${processedCommandCount}`
+                    : `forced command failure ${processedCommandCount}`;
+                emitError(lineNumber, 1, trimmed.length, forcedErrorMessage);
+                await emitPromptPossiblyCoalesced();
+                firstProcessedStatement = false;
+                lineNumber++;
+                return;
             }
 
             // Control flags for simulating process desync/undo failures.
@@ -340,7 +377,14 @@ if (looksLikeFlag(command)) {
             // Simulate errors for specific patterns
             if (trimmed.includes('undefined_symbol')) {
                 maybeFlushCoalescedPrompt();
-                emitError(lineNumber, 1, trimmed.length, 'unknown symbol: undefined_symbol');
+                if (failingGoalMarker) {
+                    writeLine('Current goal');
+                    writeLine(`  ${failingGoalMarker}`);
+                }
+                const errorMessage = failingErrorMarker
+                    ? `${failingErrorMarker}: unknown symbol: undefined_symbol`
+                    : 'unknown symbol: undefined_symbol';
+                emitError(lineNumber, 1, trimmed.length, errorMessage);
             } else if (trimmed.includes('syntax_error')) {
                 maybeFlushCoalescedPrompt();
                 emitError(lineNumber, 1, trimmed.length, 'parse error');

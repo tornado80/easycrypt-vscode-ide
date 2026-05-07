@@ -10,16 +10,14 @@ function run() {
   });
 
   const testsRoot = __dirname;
-  
-  // Add all e2e test files
+
+  // Real EasyCrypt E2E suites only (no mock binary usage).
   mocha.addFile(path.resolve(testsRoot, 'easycrypt.e2e.test.js'));
-  mocha.addFile(path.resolve(testsRoot, 'diagnostics.e2e.test.js'));
-  mocha.addFile(path.resolve(testsRoot, 'moduleImports.e2e.test.js'));
-  mocha.addFile(path.resolve(testsRoot, 'proofNavigation.e2e.test.js'));
   mocha.addFile(path.resolve(testsRoot, 'proofNavigation.real.e2e.test.js'));
-  mocha.addFile(path.resolve(testsRoot, 'proofNavigationButtons.e2e.test.js'));
-  mocha.addFile(path.resolve(testsRoot, 'perFileSessionIsolation.e2e.test.js'));
-  mocha.addFile(path.resolve(testsRoot, 'lspNoFallback.e2e.test.js'));
+  mocha.addFile(path.resolve(testsRoot, '..', '..', 'integration', 'suite', 'moduleImports.integration.test.js'));
+  mocha.addFile(path.resolve(testsRoot, '..', '..', 'integration', 'suite', 'proofNavigationButtons.integration.test.js'));
+  mocha.addFile(path.resolve(testsRoot, '..', '..', 'integration', 'suite', 'perFileSessionIsolation.integration.test.js'));
+  mocha.addFile(path.resolve(testsRoot, '..', '..', 'integration', 'suite', 'lspNoFallback.integration.test.js'));
 
   return new Promise((resolve, reject) => {
     mocha.run((failures) => {
